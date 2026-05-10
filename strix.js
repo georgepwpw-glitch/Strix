@@ -43,6 +43,18 @@ const debounce = (fn, ms = 300) => {
   let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 };
 
+// Calcula saldo atual de uma conta: saldo inicial + receitas vinculadas − despesas vinculadas
+function computeAccountBalance(account, transactions) {
+  if (!account) return 0;
+  let balance = Number(account.initialBalance) || 0;
+  for (const tx of transactions) {
+    if (tx.accountId !== account.id) continue;
+    if (tx.type === 'income') balance += Number(tx.amount) || 0;
+    else if (tx.type === 'expense') balance -= Number(tx.amount) || 0;
+  }
+  return balance;
+}
+
 /* ===================== INDEXEDDB STORAGE =====================
    Schema versionado, transações ACID, índices por data/mês/pessoa.
    Objeto stores:
@@ -53,7 +65,7 @@ const debounce = (fn, ms = 300) => {
    - audit         (id, ts, action, payload) trilha p/ undo
 ================================================================= */
 const DB_NAME = 'strix-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let dbPromise = null;
 
 function openDB() {
@@ -64,6 +76,7 @@ function openDB() {
     req.onsuccess = () => resolve(req.result);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
+      const oldVersion = e.oldVersion || 0;
       // transactions
       if (!db.objectStoreNames.contains('transactions')) {
         const s = db.createObjectStore('transactions', { keyPath: 'id' });
@@ -92,6 +105,21 @@ function openDB() {
       if (!db.objectStoreNames.contains('audit')) {
         const s = db.createObjectStore('audit', { keyPath: 'id', autoIncrement: true });
         s.createIndex('by-ts', 'ts');
+      }
+      // v2: accounts (carteiras / contas bancárias / locais com dinheiro)
+      if (oldVersion < 2) {
+        if (!db.objectStoreNames.contains('accounts')) {
+          const s = db.createObjectStore('accounts', { keyPath: 'id' });
+          s.createIndex('by-name', 'nameKey');
+          s.createIndex('by-archived', 'archived');
+        }
+        // Adiciona índice by-account em transactions (campo accountId opcional)
+        if (db.objectStoreNames.contains('transactions')) {
+          const txStore = e.target.transaction.objectStore('transactions');
+          if (!txStore.indexNames.contains('by-account')) {
+            txStore.createIndex('by-account', 'accountId');
+          }
+        }
       }
     };
   });
@@ -198,11 +226,43 @@ function parseCommand(input) {
   if (vendi) return { type: 'debt_owed_to_me', amount, person: vendi[2].trim(),
     description: vendi[1] ? vendi[1].trim() : 'venda', date, raw: text };
 
+  // ============ INVENTÁRIO / CONTAS ============
+  // "tenho 500 no nubank" / "tenho 1500 na conta do itaú" / "tenho 300 na carteira"
+  const tenho = lower.match(/^(?:eu\s+)?tenho\s+(?:r\$\s*)?[\d.,]+(?:\s+reais?)?\s+(?:no|na|em|guardado(?:s)?\s+(?:no|na|em))\s+(?:conta\s+(?:do|da|de)\s+)?([a-z\s]+)$/i);
+  if (tenho) {
+    return { type: 'account_set', name: tenho[1].trim(), amount, raw: text };
+  }
+  // "ajusta nubank para 450" / "atualiza saldo do itaú para 1200"
+  const ajusta = lower.match(/^(?:ajusta|atualiza|corrige)(?:\s+(?:saldo|conta)(?:\s+(?:do|da|de))?)?\s+([a-z\s]+?)\s+(?:para|pra)\s+(?:r\$\s*)?[\d.,]+/i);
+  if (ajusta) {
+    return { type: 'account_adjust', name: ajusta[1].trim(), amount, raw: text };
+  }
+  // "transferi 500 do itaú pro nubank" / "transferi 200 da carteira para o nubank"
+  const transferi = lower.match(/transferi\s+(?:r\$\s*)?[\d.,]+(?:\s+reais?)?\s+(?:do|da|de)\s+([a-z\s]+?)\s+(?:para|pra|pro)(?:\s+(?:o|a))?\s+([a-z\s]+)$/i);
+  if (transferi) {
+    return { type: 'transfer', from: transferi[1].trim(), to: transferi[2].trim(), amount, raw: text };
+  }
+  // "caiu 3000 de salário no itaú" / "recebi salário de 3000 no nubank"
+  const salarioMatch = lower.match(/(?:caiu|recebi|entrou)\s+(?:r\$\s*)?[\d.,]+(?:\s+reais?)?(?:\s+de\s+(salario|sal[áa]rio|adiantamento|13|13o|pix|bonus))?(?:\s+(?:no|na|em)\s+(?:conta\s+(?:do|da|de)\s+)?([a-z\s]+))?$/i);
+  if (salarioMatch && /caiu|salario|entrou/.test(lower)) {
+    const isSalary = /salario|sal[áa]rio|adiantamento|13/.test(lower);
+    return {
+      type: 'income',
+      amount,
+      description: isSalary ? 'Salário' : (salarioMatch[1] || 'Receita'),
+      category: isSalary ? 'Salário' : 'Renda',
+      account: salarioMatch[2] ? salarioMatch[2].trim() : null,
+      date, raw: text,
+    };
+  }
+
   // Pagamentos recebidos
-  const mePagou = lower.match(/^([a-z\s]+?)\s+me\s+pagou\s+(?:r\$\s*)?[\d.,]+/i);
-  const recebi = lower.match(/recebi\s+(?:r\$\s*)?[\d.,]+\s+(?:de|do|da)\s+([a-z]+)/i);
-  if (mePagou) return { type: 'debt_payment_received', amount, person: mePagou[1].trim(), date, raw: text };
-  if (recebi) return { type: 'debt_payment_received', amount, person: recebi[1].trim(), date, raw: text };
+  const mePagou = lower.match(/^([a-z\s]+?)\s+me\s+pagou\s+(?:r\$\s*)?[\d.,]+(?:\s+reais?)?(?:\s+(?:no|na|em)\s+([a-z\s]+))?$/i);
+  const recebi = lower.match(/recebi\s+(?:r\$\s*)?[\d.,]+\s+(?:de|do|da)\s+([a-z]+)(?:\s+(?:no|na|em)\s+([a-z\s]+))?$/i);
+  if (mePagou) return { type: 'debt_payment_received', amount, person: mePagou[1].trim(),
+    account: mePagou[2] ? mePagou[2].trim() : null, date, raw: text };
+  if (recebi) return { type: 'debt_payment_received', amount, person: recebi[1].trim(),
+    account: recebi[2] ? recebi[2].trim() : null, date, raw: text };
 
   // Eu devo
   const devo = lower.match(/(?:eu\s+)?devo\s+(?:r\$\s*)?[\d.,]+\s+(?:para|pra|pro|ao|a)\s+([a-z]+)/i);
@@ -234,11 +294,18 @@ function parseCommand(input) {
     return { type: 'income', amount, description: text, date, raw: text };
   }
 
-  // Gasto
+  // Gasto: aceita "no/na X" no final como conta vinculada
   const gastei = lower.match(/gastei\s+(?:r\$\s*)?[\d.,]+\s+(?:em|com|no|na|de)\s+(.+)/i);
   if (gastei) {
-    const desc = gastei[1].trim();
-    return { type: 'expense', amount, category: categorize(desc), description: desc, date, raw: text };
+    let desc = gastei[1].trim();
+    let account = null;
+    // Procura sufixo "pago no/com nubank|itau|carteira..."
+    const payMatch = desc.match(/^(.+?)\s+(?:pago|paguei)\s+(?:com|no|na|pelo|pela)\s+([a-z\s]+)$/i);
+    if (payMatch) {
+      desc = payMatch[1].trim();
+      account = payMatch[2].trim();
+    }
+    return { type: 'expense', amount, category: categorize(desc), description: desc, account, date, raw: text };
   }
 
   if (amount !== null) return { type: 'expense', amount, category: 'Outros', description: text, date, raw: text };
@@ -317,6 +384,7 @@ function App() {
   const [transactions, setTransactions] = useState([]);
   const [debts, setDebts] = useState([]);
   const [bills, setBills] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   const [budget, setBudget] = useState({ monthly: 0, weekly: 0, month: monthKey() });
   const [feedback, setFeedback] = useState(null);
   const [pendingUndo, setPendingUndo] = useState(null);
@@ -332,16 +400,18 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [txs, dbs, bls, settings, bdg] = await Promise.all([
+        const [txs, dbs, bls, accs, settings, bdg] = await Promise.all([
           dbGetAll('transactions'),
           dbGetAll('debts'),
           dbGetAll('bills'),
+          dbGetAll('accounts'),
           dbGet('meta', 'settings'),
           dbGet('meta', 'budget'),
         ]);
         setTransactions(txs || []);
         setDebts(dbs || []);
         setBills(bls || []);
+        setAccounts(accs || []);
         if (settings?.value) setTheme(settings.value.theme || 'dark');
         if (bdg?.value) setBudget(bdg.value);
 
@@ -471,6 +541,52 @@ function App() {
     return cur;
   };
 
+  /* ----- Accounts (carteiras/contas/locais com dinheiro) ----- */
+  const addAccount = async (a) => {
+    const full = {
+      ...a,
+      id: a.id || uid(),
+      nameKey: stripAccents((a.name || '').toLowerCase().trim()),
+      initialBalance: a.initialBalance || 0,
+      createdAt: a.createdAt || Date.now(),
+      archived: !!a.archived,
+    };
+    await dbPut('accounts', full);
+    setAccounts(p => [...p, full]);
+    return full;
+  };
+  const updateAccount = async (id, patch) => {
+    const cur = accounts.find(x => x.id === id);
+    if (!cur) return;
+    const upd = { ...cur, ...patch };
+    if (patch.name) upd.nameKey = stripAccents(patch.name.toLowerCase().trim());
+    await dbPut('accounts', upd);
+    setAccounts(p => p.map(x => x.id === id ? upd : x));
+  };
+  const removeAccount = async (id) => {
+    await dbDelete('accounts', id);
+    setAccounts(p => p.filter(x => x.id !== id));
+  };
+
+  // Resolve nome livre → account (fuzzy: exato, prefixo, substring)
+  const resolveAccount = useCallback((name) => {
+    if (!name) return null;
+    const key = stripAccents(name.toLowerCase().trim()).replace(/^(conta\s+(?:do|da|de)\s+)/, '');
+    const active = accounts.filter(a => !a.archived);
+    return active.find(a => a.nameKey === key)
+        || active.find(a => a.nameKey.startsWith(key))
+        || active.find(a => a.nameKey.includes(key))
+        || active.find(a => key.includes(a.nameKey))
+        || null;
+  }, [accounts]);
+
+  // Cria conta se não existir, retorna full
+  const ensureAccount = useCallback(async (name) => {
+    const found = resolveAccount(name);
+    if (found) return found;
+    return await addAccount({ name: name.replace(/^(conta\s+(?:do|da|de)\s+)/i, '').trim(), initialBalance: 0 });
+  }, [accounts, resolveAccount]);
+
   /* ----- Comando ----- */
   const handleCommand = useCallback(async (rawText) => {
     if (!rawText.trim()) return;
@@ -487,14 +603,22 @@ function App() {
     switch (cmd.type) {
       case 'expense':
       case 'income': {
+        // Resolve conta vinculada (se vier do parser)
+        let accountId = null;
+        if (cmd.account) {
+          const acc = await ensureAccount(cmd.account);
+          accountId = acc.id;
+        }
         const tx = await addTx({
           type: cmd.type, amount: cmd.amount,
           category: cmd.category || (cmd.type === 'income' ? 'Renda' : 'Outros'),
           description: cmd.description || cmd.raw,
+          accountId,
           date: cmd.date, paid: true,
         });
         await dbAudit('add_tx', tx);
-        flash(`${cmd.type === 'expense' ? 'Gasto' : 'Receita'}: ${fmt(cmd.amount)}`, 'ok',
+        const acc = accountId ? accounts.find(a => a.id === accountId) : null;
+        flash(`${cmd.type === 'expense' ? 'Gasto' : 'Receita'}: ${fmt(cmd.amount)}${acc ? ` · ${acc.name}` : ''}`, 'ok',
           { kind: 'tx', id: tx.id });
         break;
       }
@@ -531,13 +655,87 @@ function App() {
             remaining -= d.amount;
           }
         }
+        let accountId = null;
+        if (cmd.account) {
+          const acc = await ensureAccount(cmd.account);
+          accountId = acc.id;
+        }
         await addTx({
           type: 'income', amount: cmd.amount,
           category: 'Pagamento recebido',
           description: `Pagamento de ${cmd.person}`,
+          accountId,
           date: cmd.date, paid: true,
         });
         flash(`${cmd.person} pagou ${fmt(cmd.amount)}`); break;
+      }
+      // ============ INVENTÁRIO ============
+      case 'account_set': {
+        // "tenho X no nubank" — define saldo inicial se for nova; senão cria ajuste
+        const existing = resolveAccount(cmd.name);
+        if (!existing) {
+          const acc = await addAccount({ name: cmd.name, initialBalance: cmd.amount });
+          flash(`${acc.name}: ${fmt(cmd.amount)}`, 'ok', { kind: 'account', id: acc.id });
+        } else {
+          // Calcula saldo atual e cria transação de ajuste
+          const curBalance = computeAccountBalance(existing, transactions);
+          const delta = cmd.amount - curBalance;
+          if (Math.abs(delta) < 0.01) {
+            flash(`${existing.name} já está em ${fmt(cmd.amount)}`); break;
+          }
+          const tx = await addTx({
+            type: delta > 0 ? 'income' : 'expense',
+            amount: Math.abs(delta),
+            category: 'Ajuste',
+            description: `Ajuste de saldo · ${existing.name}`,
+            accountId: existing.id,
+            date: cmd.date || todayISO(), paid: true,
+          });
+          flash(`${existing.name}: ${fmt(curBalance)} → ${fmt(cmd.amount)}`, 'ok', { kind: 'tx', id: tx.id });
+        }
+        break;
+      }
+      case 'account_adjust': {
+        // Alias semântico — mesmo comportamento de account_set sobre conta existente
+        const existing = resolveAccount(cmd.name);
+        if (!existing) { flash(`Conta "${cmd.name}" não existe. Diga "tenho X no ${cmd.name}" primeiro.`, 'warn'); break; }
+        const curBalance = computeAccountBalance(existing, transactions);
+        const delta = cmd.amount - curBalance;
+        if (Math.abs(delta) < 0.01) { flash(`${existing.name} já está em ${fmt(cmd.amount)}`); break; }
+        const tx = await addTx({
+          type: delta > 0 ? 'income' : 'expense',
+          amount: Math.abs(delta),
+          category: 'Ajuste',
+          description: `Ajuste de saldo · ${existing.name}`,
+          accountId: existing.id,
+          date: cmd.date || todayISO(), paid: true,
+        });
+        flash(`${existing.name}: ${fmt(curBalance)} → ${fmt(cmd.amount)}`, 'ok', { kind: 'tx', id: tx.id });
+        break;
+      }
+      case 'transfer': {
+        const from = await ensureAccount(cmd.from);
+        const to = await ensureAccount(cmd.to);
+        if (from.id === to.id) { flash('Origem e destino iguais', 'warn'); break; }
+        const transferGroup = uid();
+        // Saída
+        await addTx({
+          type: 'expense', amount: cmd.amount,
+          category: 'Transferência',
+          description: `Para ${to.name}`,
+          accountId: from.id, transferGroup,
+          date: cmd.date || todayISO(), paid: true,
+        });
+        // Entrada
+        await addTx({
+          type: 'income', amount: cmd.amount,
+          category: 'Transferência',
+          description: `De ${from.name}`,
+          accountId: to.id, transferGroup,
+          date: cmd.date || todayISO(), paid: true,
+        });
+        flash(`${fmt(cmd.amount)}: ${from.name} → ${to.name}`);
+        break;
       }
       case 'bill': {
         const b = await addBill({ name: cmd.name, amount: cmd.amount, dueDate: cmd.dueDate, paid: cmd.paid });
@@ -574,7 +772,7 @@ function App() {
       }
       default: flash('Comando reconhecido mas não tratado', 'warn');
     }
-  }, [debts, bills, transactions, flash, scheduleNotification]);
+  }, [debts, bills, transactions, accounts, flash, scheduleNotification, resolveAccount, ensureAccount]);
 
   /* ----- Undo ----- */
   const doUndo = useCallback(async () => {
@@ -622,19 +820,29 @@ function App() {
     }
     let billsPending = 0;
     for (const b of bills) if (!b.paid) billsPending += (b.amount || 0);
+
+    // Patrimônio = soma dos saldos das contas ativas + te devem − você deve − contas pendentes
+    let accountsTotal = 0;
+    for (const a of accounts) {
+      if (a.archived) continue;
+      accountsTotal += computeAccountBalance(a, transactions);
+    }
+    const netWorth = accountsTotal + owedToMe - iOwe - billsPending;
+
     return {
       spentMonth, spentWeek, spentToday, incomeMonth,
       remainingMonth: budget.monthly - spentMonth,
       remainingWeek: budget.weekly - spentWeek,
       owedToMe, iOwe, billsPending,
+      accountsTotal, netWorth,
     };
-  }, [transactions, debts, bills, budget]);
+  }, [transactions, debts, bills, budget, accounts]);
 
   /* ----- Export / Import ----- */
   const exportData = useCallback(async () => {
     const data = {
-      version: 1, exportedAt: new Date().toISOString(),
-      transactions, debts, bills, budget,
+      version: 2, exportedAt: new Date().toISOString(),
+      transactions, debts, bills, accounts, budget,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -642,7 +850,7 @@ function App() {
     a.href = url; a.download = `strix-backup-${todayISO()}.json`;
     a.click(); URL.revokeObjectURL(url);
     flash('Backup baixado');
-  }, [transactions, debts, bills, budget, flash]);
+  }, [transactions, debts, bills, accounts, budget, flash]);
 
   const importData = useCallback(async (file) => {
     try {
@@ -652,10 +860,11 @@ function App() {
       // Limpa tudo
       const db = await openDB();
       await new Promise((res, rej) => {
-        const tx = db.transaction(['transactions','debts','bills','meta'], 'readwrite');
+        const tx = db.transaction(['transactions','debts','bills','accounts','meta'], 'readwrite');
         tx.objectStore('transactions').clear();
         tx.objectStore('debts').clear();
         tx.objectStore('bills').clear();
+        tx.objectStore('accounts').clear();
         tx.objectStore('meta').delete('budget');
         tx.oncomplete = () => res();
         tx.onerror = () => rej(tx.error);
@@ -663,10 +872,12 @@ function App() {
       for (const t of (data.transactions || [])) await dbPut('transactions', { ...t, month: t.date?.slice(0,7) });
       for (const d of (data.debts || [])) await dbPut('debts', { ...d, personKey: stripAccents((d.person||'').toLowerCase()) });
       for (const b of (data.bills || [])) await dbPut('bills', b);
+      for (const a of (data.accounts || [])) await dbPut('accounts', { ...a, nameKey: stripAccents((a.name||'').toLowerCase()) });
       if (data.budget) await dbPut('meta', { key: 'budget', value: data.budget });
       setTransactions(data.transactions || []);
       setDebts(data.debts || []);
       setBills(data.bills || []);
+      setAccounts(data.accounts || []);
       if (data.budget) setBudget(data.budget);
       flash('Dados restaurados');
     } catch (e) {
@@ -747,6 +958,27 @@ function App() {
         onRemoveTx: async (id) => { await removeTx(id); flash('Removido'); },
         askNotifPermission,
       }),
+      tab === 'wealth' && h(WealthTab, {
+        t, styles, accounts, transactions, summary,
+        onCommand: handleCommand,
+        toggleArchive: (id) => updateAccount(id, { archived: !accounts.find(a=>a.id===id)?.archived }),
+        removeAccount: async (id) => {
+          const acc = accounts.find(a => a.id === id);
+          if (!acc) return;
+          const linked = transactions.filter(tx => tx.accountId === id).length;
+          if (linked > 0) {
+            if (!confirm(`${linked} transaçōes estão vinculadas a "${acc.name}". Apagar conta vai desvincular (transaçōes ficam). Continuar?`)) return;
+          } else {
+            if (!confirm(`Apagar conta "${acc.name}"?`)) return;
+          }
+          await removeAccount(id);
+          // Desvincula transações
+          for (const tx of transactions.filter(t => t.accountId === id)) {
+            await updateTx(tx.id, { accountId: null });
+          }
+          flash('Conta removida');
+        },
+      }),
       tab === 'dashboard' && h(DashboardTab, {
         t, theme, styles, transactions, summary,
       }),
@@ -794,7 +1026,8 @@ function App() {
     h('div', { style: styles.tabBar },
       [
         ['home', '◐', 'Capturar'],
-        ['dashboard', '▦', 'Dashboard'],
+        ['wealth', '◈', 'Patrimônio'],
+        ['dashboard', '▦', 'Painel'],
         ['details', '◎', 'Detalhes'],
         ['settings', '⚙', 'Ajustes'],
       ].map(([id, icon, label]) =>
@@ -856,12 +1089,13 @@ function makeStyles(t, theme) {
       boxShadow: '0 8px 32px rgba(0,0,0,0.3)', zIndex: 50,
     },
     tab: (active) => ({
-      flex: 1, padding: '8px 4px', borderRadius: 17,
+      flex: 1, padding: '8px 2px', borderRadius: 16,
       background: active ? t.accentSoft : 'transparent',
       color: active ? t.accent : t.textDim,
-      fontWeight: active ? 600 : 500, fontSize: 10,
+      fontWeight: active ? 600 : 500, fontSize: 9,
       border: 'none', cursor: 'pointer',
       display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
+      minWidth: 0,
     }),
     input: {
       width: '100%', padding: '13px 14px', borderRadius: 14,
@@ -1064,6 +1298,162 @@ const TxRow = memo(function TxRow({ tx, t, onDelete }) {
     h('div', { style: { fontSize: 15, fontWeight: 600, color: isExp ? t.text : t.success } }, fmt(tx.amount)),
     h('button', {
       onClick: () => { if (confirm('Remover este lançamento?')) onDelete(); },
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18, padding: 4 }
+    }, '×')
+  );
+});
+
+/* ===================== WEALTH (Patrimônio) ===================== */
+const WealthTab = memo(function WealthTab({ t, styles, accounts, transactions, summary, onCommand, toggleArchive, removeAccount }) {
+  const [input, setInput] = useState('');
+
+  const activeAccounts = useMemo(() =>
+    accounts.filter(a => !a.archived)
+      .map(a => ({ ...a, balance: computeAccountBalance(a, transactions) }))
+      .sort((a, b) => b.balance - a.balance),
+  [accounts, transactions]);
+
+  const archivedAccounts = useMemo(() =>
+    accounts.filter(a => a.archived)
+      .map(a => ({ ...a, balance: computeAccountBalance(a, transactions) })),
+  [accounts, transactions]);
+
+  const unassignedTotal = useMemo(() => {
+    let inc = 0, exp = 0;
+    for (const tx of transactions) {
+      if (tx.accountId) continue;
+      if (tx.type === 'income') inc += tx.amount;
+      else if (tx.type === 'expense') exp += tx.amount;
+    }
+    return inc - exp;
+  }, [transactions]);
+
+  const submit = () => {
+    if (!input.trim()) return;
+    onCommand(input);
+    setInput('');
+  };
+
+  const examples = [
+    'tenho 500 no nubank',
+    'tenho 1500 na conta do itaú',
+    'tenho 300 na carteira',
+    'caiu 3000 de salário no nubank',
+    'transferi 200 do itaú pro nubank',
+    'ajusta nubank para 450',
+  ];
+
+  return h('div', { className: 'strix-fade' },
+    // Hero: patrimônio líquido
+    h('div', { style: { ...styles.card, marginBottom: 12, position: 'relative', overflow: 'hidden' } },
+      h('div', {
+        style: {
+          position: 'absolute', top: -40, right: -40, width: 160, height: 160, borderRadius: '50%',
+          background: `radial-gradient(circle, ${t.accentSoft} 0%, transparent 70%)`, pointerEvents: 'none',
+        }
+      }),
+      h('div', { style: styles.cardTitle }, 'Patrimônio líquido'),
+      h('div', { style: { ...styles.bigNumber, color: summary.netWorth >= 0 ? t.text : t.danger } },
+        fmt(summary.netWorth)),
+      h('div', { style: { fontSize: 11, color: t.textDim, marginTop: 6 } },
+        'soma das contas + te devem − você deve − contas pendentes')
+    ),
+
+    // Breakdown
+    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 } },
+      h(KPI, { t, label: 'Em contas', value: fmt(summary.accountsTotal), accent: t.text }),
+      h(KPI, { t, label: 'A receber', value: fmt(summary.owedToMe), accent: t.success }),
+      h(KPI, { t, label: 'A pagar', value: fmt(summary.iOwe + summary.billsPending), accent: t.danger }),
+      h(KPI, { t, label: 'Não atribuído', value: fmt(unassignedTotal), accent: t.textDim })
+    ),
+
+    // Captura
+    h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, 'Adicionar local ou registrar saldo'),
+      h('input', {
+        style: styles.input,
+        placeholder: 'Ex: "tenho 500 no nubank"',
+        value: input,
+        onChange: (e) => setInput(e.target.value),
+        onKeyDown: (e) => e.key === 'Enter' && submit(),
+      }),
+      h('button', {
+        style: { ...styles.primaryBtn, marginTop: 10, width: '100%', opacity: input.trim() ? 1 : 0.5 },
+        onClick: submit, disabled: !input.trim(),
+      }, 'Registrar'),
+      h('div', { style: { marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 6 } },
+        examples.map(s => h('button', {
+          key: s, onClick: () => setInput(s),
+          style: {
+            fontSize: 11, padding: '6px 10px', borderRadius: 10,
+            background: t.surfaceHi, color: t.textDim,
+            border: `1px solid ${t.border}`, cursor: 'pointer',
+          }
+        }, s))
+      )
+    ),
+
+    // Lista de contas
+    h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, `Locais · ${activeAccounts.length}`),
+      activeAccounts.length === 0
+        ? h('div', { style: { padding: '24px 8px', textAlign: 'center', color: t.textFaint, fontSize: 14 } },
+            'Nenhum local cadastrado. Diga "tenho X no nubank" para começar.')
+        : activeAccounts.map(a => h(AccountRow, {
+            key: a.id, account: a, t,
+            onArchive: () => toggleArchive(a.id),
+            onDelete: () => removeAccount(a.id),
+          }))
+    ),
+
+    // Arquivadas
+    archivedAccounts.length > 0 && h('div', { style: styles.card },
+      h('div', { style: styles.cardTitle }, `Arquivadas · ${archivedAccounts.length}`),
+      archivedAccounts.map(a => h(AccountRow, {
+        key: a.id, account: a, t, archived: true,
+        onArchive: () => toggleArchive(a.id),
+        onDelete: () => removeAccount(a.id),
+      }))
+    )
+  );
+});
+
+const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, onDelete }) {
+  return h('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 12,
+      padding: '12px 0', borderBottom: `1px solid ${t.border}`,
+      opacity: archived ? 0.5 : 1,
+    }
+  },
+    h('div', {
+      style: {
+        width: 36, height: 36, borderRadius: 12,
+        background: account.balance >= 0 ? 'rgba(48,209,88,0.12)' : t.accentSoft,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        color: account.balance >= 0 ? t.success : t.accent, fontSize: 14, fontWeight: 600, flexShrink: 0,
+      }
+    }, '◈'),
+    h('div', { style: { flex: 1, minWidth: 0 } },
+      h('div', {
+        style: {
+          fontSize: 14, fontWeight: 600, color: t.text, textTransform: 'capitalize',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }
+      }, account.name),
+      h('div', { style: { fontSize: 11, color: t.textDim, marginTop: 2 } },
+        `inicial ${fmt(account.initialBalance)}`)
+    ),
+    h('div', {
+      style: { fontSize: 15, fontWeight: 700, color: account.balance >= 0 ? t.text : t.danger }
+    }, fmt(account.balance)),
+    h('button', {
+      onClick: onArchive,
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
+      title: archived ? 'Desarquivar' : 'Arquivar',
+    }, archived ? '↑' : '↓'),
+    h('button', {
+      onClick: onDelete,
       style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18, padding: 4 }
     }, '×')
   );
