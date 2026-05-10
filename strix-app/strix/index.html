@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0a0a0c" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Strix" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="description" content="Strix — finanças pessoais por linguagem natural" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <title>Strix · finanças sob comando</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow-x: hidden; overscroll-behavior-y: contain; }
+    body {
+      background: #0a0a0c;
+      color: #f5f5f7;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-font-smoothing: antialiased;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    @media (prefers-color-scheme: light) {
+      body { background: #f2f2f7; color: #1d1d1f; }
+    }
+    #root { min-height: 100vh; }
+    /* Splash inicial enquanto React carrega */
+    .strix-splash {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 16px; z-index: 9999;
+      background: radial-gradient(ellipse at top, #1a0608 0%, #0a0a0c 60%);
+    }
+    .strix-splash-name {
+      font-size: 32px; font-weight: 700; letter-spacing: -0.03em;
+      background: linear-gradient(135deg, #f5f5f7, #ff453a 120%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text; color: transparent;
+    }
+    .strix-splash-sub { font-size: 11px; color: #8e8e93; letter-spacing: 0.2em; text-transform: uppercase; }
+    @keyframes blink { 0%,90%,100% { transform: scaleY(1); } 95% { transform: scaleY(0.1); } }
+    .blink-eye { transform-origin: center; animation: blink 4s infinite; }
+    *::-webkit-scrollbar { width: 0; height: 0; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="strix-splash">
+      <svg width="84" height="84" viewBox="0 0 100 100">
+        <ellipse cx="50" cy="58" rx="30" ry="34" fill="#16161a" stroke="#ff453a" stroke-width="2.2"/>
+        <path d="M25 32 L22 18 L34 28 Z" fill="#16161a" stroke="#ff453a" stroke-width="2.2"/>
+        <path d="M75 32 L78 18 L66 28 Z" fill="#16161a" stroke="#ff453a" stroke-width="2.2"/>
+        <circle cx="40" cy="48" r="7" fill="#ff453a" class="blink-eye"/>
+        <circle cx="60" cy="48" r="7" fill="#ff453a" class="blink-eye"/>
+        <path d="M50 54 L46 60 L54 60 Z" fill="#ff453a"/>
+      </svg>
+      <div class="strix-splash-name">strix</div>
+      <div class="strix-splash-sub">carregando</div>
+    </div>
+  </div>
+
+  <!-- React + Recharts via CDN com SRI desativado para simplicidade -->
+  <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+
+  <script src="strix.js"></script>
+
+  <script>
+    // Service Worker (offline + instalável)
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW falhou:', err));
+      });
+    }
+  </script>
+</body>
+</html>
