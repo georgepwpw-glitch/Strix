@@ -1,5 +1,5 @@
 // Strix Service Worker — cache offline + atualização em background
-const CACHE_VERSION = 'strix-v2';
+const CACHE_VERSION = 'strix-v3';
 const CACHE_FILES = [
   './',
   './index.html',

@@ -55,6 +55,56 @@ function computeAccountBalance(account, transactions) {
   return balance;
 }
 
+// Cartão: dada uma compra, retorna array de meses afetados [{month: 'YYYY-MM', installment: 1, amount: x}, ...]
+function cardInstallmentsFor(purchase) {
+  const result = [];
+  const [yy, mm] = purchase.startMonth.split('-').map(Number);
+  const perMonth = purchase.amount / purchase.installments;
+  for (let i = 0; i < purchase.installments; i++) {
+    const d = new Date(yy, mm - 1 + i, 1);
+    result.push({
+      month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+      installment: i + 1,
+      of: purchase.installments,
+      amount: perMonth,
+    });
+  }
+  return result;
+}
+
+// Soma todas as parcelas ativas de cartão que caem num mês específico
+function cardTotalForMonth(purchases, month) {
+  let total = 0;
+  const items = [];
+  for (const p of purchases) {
+    if (!p.active) continue;
+    for (const inst of cardInstallmentsFor(p)) {
+      if (inst.month === month) {
+        total += inst.amount;
+        items.push({ ...inst, purchaseId: p.id, description: p.description });
+      }
+    }
+  }
+  return { total, items };
+}
+
+// Próximo mês relativo a YYYY-MM
+function nextMonth(monthStr) {
+  const [yy, mm] = monthStr.split('-').map(Number);
+  const d = new Date(yy, mm, 1); // mm já é 1-indexed, então isso vai pra mm+1 efetivamente
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function prevMonth(monthStr) {
+  const [yy, mm] = monthStr.split('-').map(Number);
+  const d = new Date(yy, mm - 2, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function monthLabel(monthStr) {
+  const [yy, mm] = monthStr.split('-').map(Number);
+  const d = new Date(yy, mm - 1, 1);
+  return d.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+}
+
 /* ===================== INDEXEDDB STORAGE =====================
    Schema versionado, transações ACID, índices por data/mês/pessoa.
    Objeto stores:
@@ -65,7 +115,7 @@ function computeAccountBalance(account, transactions) {
    - audit         (id, ts, action, payload) trilha p/ undo
 ================================================================= */
 const DB_NAME = 'strix-db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let dbPromise = null;
 
 function openDB() {
@@ -97,28 +147,39 @@ function openDB() {
         s.createIndex('by-due', 'dueDate');
         s.createIndex('by-paid', 'paid');
       }
-      // meta (budget, settings, schemaVersion)
+      // meta
       if (!db.objectStoreNames.contains('meta')) {
         db.createObjectStore('meta', { keyPath: 'key' });
       }
-      // audit (trilha de undo)
+      // audit
       if (!db.objectStoreNames.contains('audit')) {
         const s = db.createObjectStore('audit', { keyPath: 'id', autoIncrement: true });
         s.createIndex('by-ts', 'ts');
       }
-      // v2: accounts (carteiras / contas bancárias / locais com dinheiro)
+      // v2: accounts
       if (oldVersion < 2) {
         if (!db.objectStoreNames.contains('accounts')) {
           const s = db.createObjectStore('accounts', { keyPath: 'id' });
           s.createIndex('by-name', 'nameKey');
           s.createIndex('by-archived', 'archived');
         }
-        // Adiciona índice by-account em transactions (campo accountId opcional)
         if (db.objectStoreNames.contains('transactions')) {
           const txStore = e.target.transaction.objectStore('transactions');
           if (!txStore.indexNames.contains('by-account')) {
             txStore.createIndex('by-account', 'accountId');
           }
+        }
+      }
+      // v3: cartão de crédito
+      if (oldVersion < 3) {
+        if (!db.objectStoreNames.contains('cardPurchases')) {
+          const s = db.createObjectStore('cardPurchases', { keyPath: 'id' });
+          s.createIndex('by-startMonth', 'startMonth');
+          s.createIndex('by-active', 'active');
+        }
+        if (!db.objectStoreNames.contains('cardPayments')) {
+          const s = db.createObjectStore('cardPayments', { keyPath: 'id' });
+          s.createIndex('by-month', 'month');
         }
       }
     };
@@ -207,6 +268,40 @@ function parseCommand(input) {
       day: day ? parseInt(day[1]) : null, raw: text };
   }
 
+  // ============ EXCLUSÃO ============
+  // "apaga/exclui/remove o último gasto/lançamento"
+  const delUltimo = lower.match(/^(?:apaga|exclui|remove|deleta|tira)\s+(?:o|a|um|uma)?\s*(?:ultim[oa]|recente)\s+(gasto|lan[çc]amento|transa[çc][ãa]o|d[íi]vida|conta|local|despesa|receita|entrada)?/i);
+  if (delUltimo) {
+    return { type: 'delete_last', target: delUltimo[1] || 'any', raw: text };
+  }
+  // "apaga gasto de 30 em gasolina" / "exclui gasto de gasolina" / "apaga conta da tim"
+  const delEspec = lower.match(/^(?:apaga|exclui|remove|deleta|tira)\s+(?:o|a|um|uma)?\s*(gasto|lan[çc]amento|despesa|receita|entrada|d[íi]vida|conta|local|transa[çc][ãa]o)?\s*(?:de|com|do|da|em|no|na)?\s*(.+)$/i);
+  if (delEspec) {
+    return {
+      type: 'delete_match',
+      target: delEspec[1] || 'any',
+      query: delEspec[2].trim(),
+      amount, raw: text,
+    };
+  }
+
+  // ============ EDIÇÃO ============
+  // "muda/altera/edita gasto de gasolina para 40" / "renomeia nubank para nu bank"
+  const editaValor = lower.match(/^(?:muda|altera|edita|corrige|atualiza)\s+(?:o|a)?\s*(gasto|lan[çc]amento|despesa|receita|d[íi]vida|conta|local|transa[çc][ãa]o)?\s*(?:de|do|da|em|com)?\s*(.+?)\s+(?:para|pra)\s+(?:r\$\s*)?[\d.,]+/i);
+  if (editaValor) {
+    return {
+      type: 'edit_amount',
+      target: editaValor[1] || 'any',
+      query: editaValor[2].trim(),
+      newAmount: amount, raw: text,
+    };
+  }
+  // "renomeia X para Y" (foco em contas/locais)
+  const renomeia = lower.match(/^(?:renomeia|renomear)\s+(.+?)\s+(?:para|pra)\s+(.+)$/i);
+  if (renomeia) {
+    return { type: 'rename', from: renomeia[1].trim(), to: renomeia[2].trim(), raw: text };
+  }
+
   // Orçamentos
   if (/(esse|este)\s+mes.*(posso|vou|consigo)\s+gastar/.test(lower)
       || /orcamento\s+(do\s+)?mes/.test(lower)
@@ -284,9 +379,25 @@ function parseCommand(input) {
     return { type: 'bill', name: conta[1].trim(), amount, dueDate, paid: !naoPago && paguei, raw: text };
   }
 
-  // Cartão
-  if (/cart[ao]o(\s+de\s+credito)?/.test(lower)) {
-    return { type: 'expense', amount, category: 'Cartão', description: 'Fatura cartão', date, raw: text };
+  // ============ CARTÃO DE CRÉDITO ============
+  // "paguei o cartão" / "paguei a fatura do cartão" / "paguei 590 do cartão"
+  if (/^(paguei|quitei)\s+(?:a\s+fatura\s+(?:do\s+)?)?(?:o\s+)?cart[ao]o/.test(lower)
+      || /paguei\s+(?:r\$\s*)?[\d.,]+\s+(?:do|da|de)\s+cart[ao]o/.test(lower)
+      || /paguei\s+(?:r\$\s*)?[\d.,]+\s+(?:de|da)\s+fatura/.test(lower)) {
+    return { type: 'card_payment', amount, date, raw: text };
+  }
+  // "comprei algo de 600 no cartão em 3x" / "passei 300 no cartão em 6x"
+  // "300 no cartão" / "gastei 300 no cartão em 2x"
+  const parcelMatch = lower.match(/(?:comprei|passei|gastei)?\s*(?:r\$\s*)?[\d.,]+(?:\s+reais?)?(?:\s+(?:em|com|de)\s+(.+?))?\s+(?:no|com|pelo)\s+cart[ao]o(?:\s+em\s+(\d+)\s*x)?/i);
+  if (parcelMatch && /cart[ao]o/.test(lower)) {
+    const installments = parcelMatch[2] ? parseInt(parcelMatch[2]) : 1;
+    const description = parcelMatch[1] ? parcelMatch[1].trim() : 'Compra no cartão';
+    return {
+      type: 'card_purchase',
+      amount, installments,
+      description: description.replace(/^em\s+/, '').trim(),
+      date, raw: text,
+    };
   }
 
   // Renda
@@ -299,7 +410,6 @@ function parseCommand(input) {
   if (gastei) {
     let desc = gastei[1].trim();
     let account = null;
-    // Procura sufixo "pago no/com nubank|itau|carteira..."
     const payMatch = desc.match(/^(.+?)\s+(?:pago|paguei)\s+(?:com|no|na|pelo|pela)\s+([a-z\s]+)$/i);
     if (payMatch) {
       desc = payMatch[1].trim();
@@ -385,6 +495,8 @@ function App() {
   const [debts, setDebts] = useState([]);
   const [bills, setBills] = useState([]);
   const [accounts, setAccounts] = useState([]);
+  const [cardPurchases, setCardPurchases] = useState([]);
+  const [cardPayments, setCardPayments] = useState([]);
   const [budget, setBudget] = useState({ monthly: 0, weekly: 0, month: monthKey() });
   const [feedback, setFeedback] = useState(null);
   const [pendingUndo, setPendingUndo] = useState(null);
@@ -392,6 +504,7 @@ function App() {
   const [listening, setListening] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [installPrompt, setInstallPrompt] = useState(null);
+  const [editing, setEditing] = useState(null); // { kind, item }
 
   const recogRef = useRef(null);
   const t = themes[theme];
@@ -400,11 +513,13 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [txs, dbs, bls, accs, settings, bdg] = await Promise.all([
+        const [txs, dbs, bls, accs, cps, cpays, settings, bdg] = await Promise.all([
           dbGetAll('transactions'),
           dbGetAll('debts'),
           dbGetAll('bills'),
           dbGetAll('accounts'),
+          dbGetAll('cardPurchases'),
+          dbGetAll('cardPayments'),
           dbGet('meta', 'settings'),
           dbGet('meta', 'budget'),
         ]);
@@ -412,6 +527,8 @@ function App() {
         setDebts(dbs || []);
         setBills(bls || []);
         setAccounts(accs || []);
+        setCardPurchases(cps || []);
+        setCardPayments(cpays || []);
         if (settings?.value) setTheme(settings.value.theme || 'dark');
         if (bdg?.value) setBudget(bdg.value);
 
@@ -586,6 +703,51 @@ function App() {
     if (found) return found;
     return await addAccount({ name: name.replace(/^(conta\s+(?:do|da|de)\s+)/i, '').trim(), initialBalance: 0 });
   }, [accounts, resolveAccount]);
+
+  /* ----- Cartão de crédito ----- */
+  const addCardPurchase = async (p) => {
+    const full = {
+      ...p, id: p.id || uid(),
+      startMonth: p.startMonth || monthKey(),
+      installments: p.installments || 1,
+      active: p.active !== false,
+      createdAt: Date.now(),
+    };
+    await dbPut('cardPurchases', full);
+    setCardPurchases(prev => [...prev, full]);
+    return full;
+  };
+  const updateCardPurchase = async (id, patch) => {
+    const cur = cardPurchases.find(p => p.id === id);
+    if (!cur) return;
+    const upd = { ...cur, ...patch };
+    await dbPut('cardPurchases', upd);
+    setCardPurchases(prev => prev.map(p => p.id === id ? upd : p));
+  };
+  const removeCardPurchase = async (id) => {
+    await dbDelete('cardPurchases', id);
+    setCardPurchases(prev => prev.filter(p => p.id !== id));
+  };
+
+  // Pagamento de fatura: registra payment, marca parcelas do mês como "pagas"
+  // (na verdade, "pagar fatura" só registra payment + cria transaction de despesa.
+  // O contador automaticamente avança porque ele soma só as parcelas ativas a partir
+  // do mês atual / sem payment registrado nesse mês.)
+  const payCard = async (amount, month) => {
+    const mKey = month || monthKey();
+    const id = uid();
+    const payment = { id, month: mKey, amount, date: todayISO(), createdAt: Date.now() };
+    await dbPut('cardPayments', payment);
+    setCardPayments(prev => [...prev, payment]);
+    // Registra como transação para entrar no gasto do mês
+    await addTx({
+      type: 'expense', amount,
+      category: 'Cartão',
+      description: `Fatura cartão · ${monthLabel(mKey)}`,
+      date: todayISO(), paid: true, cardPaymentId: id,
+    });
+    return payment;
+  };
 
   /* ----- Comando ----- */
   const handleCommand = useCallback(async (rawText) => {
@@ -770,20 +932,168 @@ function App() {
         }
         break;
       }
+      // ============ EXCLUSÃO ============
+      case 'delete_last': {
+        // Decide qual coleção olhar
+        const t = cmd.target;
+        let removed = null, kind = null;
+        if (/d[íi]vida/.test(t) && debts.length) {
+          const last = [...debts].sort((a,b) => (b.id > a.id ? 1 : -1))[0];
+          if (last) { await removeDebt(last.id); removed = last; kind = 'debt'; }
+        } else if (/(conta|local)/.test(t) && accounts.length) {
+          // Última conta criada
+          const last = [...accounts].sort((a,b) => (b.createdAt||0) - (a.createdAt||0))[0];
+          if (last) { await removeAccount(last.id); removed = last; kind = 'account'; }
+        } else if (transactions.length) {
+          // Última transação (por id, que tem timestamp)
+          const last = transactions[transactions.length - 1];
+          if (last) { await removeTx(last.id); removed = last; kind = 'tx'; }
+        }
+        if (removed) flash(`Removido: ${removed.description || removed.name || removed.person}`, 'ok', { kind, restore: removed });
+        else flash('Nada para excluir', 'warn');
+        break;
+      }
+      case 'delete_match': {
+        const query = stripAccents(cmd.query.toLowerCase());
+        const matchesTx = (tx) => {
+          const desc = stripAccents((tx.description || '').toLowerCase());
+          const cat = stripAccents((tx.category || '').toLowerCase());
+          const amountOk = !cmd.amount || Math.abs(tx.amount - cmd.amount) < 0.01;
+          return amountOk && (desc.includes(query) || cat.includes(query) || query.includes(desc) || query.includes(cat));
+        };
+        const matchesDebt = (d) => {
+          const person = stripAccents((d.person || '').toLowerCase());
+          const desc = stripAccents((d.description || '').toLowerCase());
+          return person.includes(query) || query.includes(person) || desc.includes(query);
+        };
+        const matchesBill = (b) => stripAccents((b.name || '').toLowerCase()).includes(query);
+        const matchesAcc = (a) => stripAccents((a.name || '').toLowerCase()).includes(query);
+
+        let candidatesTx = [], candidatesDebt = [], candidatesBill = [], candidatesAcc = [];
+        if (/gasto|despesa|receita|entrada|lan[çc]amento|transa[çc][ãa]o|any/.test(cmd.target)) {
+          candidatesTx = transactions.filter(matchesTx);
+        }
+        if (/d[íi]vida|any/.test(cmd.target)) candidatesDebt = debts.filter(matchesDebt);
+        if (/conta|any/.test(cmd.target)) candidatesBill = bills.filter(matchesBill);
+        if (/conta|local|any/.test(cmd.target)) candidatesAcc = accounts.filter(matchesAcc);
+
+        // Prioridade: tx → debt → bill → account
+        const totalCount = candidatesTx.length + candidatesDebt.length + candidatesBill.length + candidatesAcc.length;
+        if (totalCount === 0) { flash(`Não encontrei "${cmd.query}"`, 'warn'); break; }
+        if (totalCount > 1 && candidatesTx.length > 1) {
+          // Pega o mais recente
+          const last = candidatesTx[candidatesTx.length - 1];
+          await removeTx(last.id);
+          flash(`Removido o mais recente · ${last.description}`, 'ok', { kind: 'tx', restore: last });
+          if (candidatesTx.length > 1) {
+            // Avisa que há outros parecidos (não-bloqueante)
+            setTimeout(() => flash(`Há mais ${candidatesTx.length - 1} parecidos — repita para excluir`, 'warn'), 3200);
+          }
+          break;
+        }
+        if (candidatesTx.length === 1) {
+          await removeTx(candidatesTx[0].id);
+          flash(`Removido: ${candidatesTx[0].description || candidatesTx[0].category}`, 'ok', { kind: 'tx', restore: candidatesTx[0] });
+        } else if (candidatesDebt.length >= 1) {
+          await removeDebt(candidatesDebt[0].id);
+          flash(`Dívida removida: ${candidatesDebt[0].person}`, 'ok', { kind: 'debt', restore: candidatesDebt[0] });
+        } else if (candidatesBill.length >= 1) {
+          await removeBill(candidatesBill[0].id);
+          flash(`Conta removida: ${candidatesBill[0].name}`, 'ok', { kind: 'bill', restore: candidatesBill[0] });
+        } else if (candidatesAcc.length >= 1) {
+          await removeAccount(candidatesAcc[0].id);
+          flash(`Local removido: ${candidatesAcc[0].name}`, 'ok', { kind: 'account', restore: candidatesAcc[0] });
+        }
+        break;
+      }
+      // ============ EDIÇÃO ============
+      case 'edit_amount': {
+        if (cmd.newAmount === null) { flash('Valor novo não identificado', 'warn'); break; }
+        const query = stripAccents(cmd.query.toLowerCase());
+        const matches = transactions.filter(tx => {
+          const desc = stripAccents((tx.description || '').toLowerCase());
+          const cat = stripAccents((tx.category || '').toLowerCase());
+          return desc.includes(query) || cat.includes(query) || query.includes(desc);
+        });
+        if (matches.length === 0) { flash(`Não encontrei "${cmd.query}"`, 'warn'); break; }
+        const target = matches[matches.length - 1]; // mais recente
+        const oldAmt = target.amount;
+        await updateTx(target.id, { amount: cmd.newAmount });
+        flash(`${target.description}: ${fmt(oldAmt)} → ${fmt(cmd.newAmount)}`);
+        if (matches.length > 1) {
+          setTimeout(() => flash(`Há ${matches.length - 1} outros parecidos — repita para editar`, 'warn'), 3200);
+        }
+        break;
+      }
+      case 'rename': {
+        // Tenta renomear conta primeiro (caso mais comum)
+        const fromKey = stripAccents(cmd.from.toLowerCase());
+        const acc = accounts.find(a => a.nameKey === fromKey || a.nameKey.includes(fromKey));
+        if (acc) {
+          await updateAccount(acc.id, { name: cmd.to });
+          flash(`${acc.name} → ${cmd.to}`);
+          break;
+        }
+        // Tenta renomear conta (bill)
+        const bill = bills.find(b => stripAccents(b.name.toLowerCase()).includes(fromKey));
+        if (bill) {
+          await updateBill(bill.id, { name: cmd.to });
+          flash(`Conta ${bill.name} → ${cmd.to}`);
+          break;
+        }
+        flash(`Não encontrei "${cmd.from}" para renomear`, 'warn');
+        break;
+      }
+      case 'card_purchase': {
+        const p = await addCardPurchase({
+          amount: cmd.amount,
+          description: cmd.description,
+          installments: cmd.installments,
+          startMonth: nextMonth(monthKey()), // próxima fatura
+        });
+        const per = (cmd.amount / cmd.installments);
+        flash(`Cartão · ${cmd.installments}x ${fmt(per)} · ${cmd.description}`, 'ok', { kind: 'card', id: p.id });
+        break;
+      }
+      case 'card_payment': {
+        // Calcula automaticamente o valor da fatura do mês se não foi dito
+        const mKey = monthKey();
+        let amt = cmd.amount;
+        if (!amt) {
+          const { total } = cardTotalForMonth(cardPurchases, mKey);
+          amt = total;
+        }
+        if (!amt || amt === 0) { flash('Sem fatura de cartão para pagar', 'warn'); break; }
+        await payCard(amt, mKey);
+        flash(`Fatura paga: ${fmt(amt)} ✓`);
+        break;
+      }
       default: flash('Comando reconhecido mas não tratado', 'warn');
     }
-  }, [debts, bills, transactions, accounts, flash, scheduleNotification, resolveAccount, ensureAccount]);
+  }, [debts, bills, transactions, accounts, cardPurchases, flash, scheduleNotification, resolveAccount, ensureAccount]);
 
   /* ----- Undo ----- */
   const doUndo = useCallback(async () => {
     if (!pendingUndo) return;
-    if (pendingUndo.kind === 'tx') await removeTx(pendingUndo.id);
-    if (pendingUndo.kind === 'debt') await removeDebt(pendingUndo.id);
-    if (pendingUndo.kind === 'bill') await removeBill(pendingUndo.id);
+    // Caso 1: criação recente → remove
+    if (pendingUndo.id && !pendingUndo.restore) {
+      if (pendingUndo.kind === 'tx') await removeTx(pendingUndo.id);
+      if (pendingUndo.kind === 'debt') await removeDebt(pendingUndo.id);
+      if (pendingUndo.kind === 'bill') await removeBill(pendingUndo.id);
+      if (pendingUndo.kind === 'account') await removeAccount(pendingUndo.id);
+    }
+    // Caso 2: exclusão recente → restaura
+    if (pendingUndo.restore) {
+      const r = pendingUndo.restore;
+      if (pendingUndo.kind === 'tx') await addTx(r);
+      if (pendingUndo.kind === 'debt') await addDebt(r);
+      if (pendingUndo.kind === 'bill') await addBill(r);
+      if (pendingUndo.kind === 'account') await addAccount(r);
+    }
     setPendingUndo(null); setFeedback({ msg: 'Desfeito', kind: 'ok' });
     setTimeout(() => setFeedback(null), 1500);
     haptic(15);
-  }, [pendingUndo, transactions, debts, bills]);
+  }, [pendingUndo, transactions, debts, bills, accounts]);
 
   /* ----- Voz ----- */
   const startVoice = useCallback((onResult) => {
@@ -829,20 +1139,32 @@ function App() {
     }
     const netWorth = accountsTotal + owedToMe - iOwe - billsPending;
 
+    // Cartão: fatura atual e próxima
+    const cardThisMonth = cardTotalForMonth(cardPurchases, mKey);
+    const cardNextMonthData = cardTotalForMonth(cardPurchases, nextMonth(mKey));
+    // Detecta se a fatura do mês atual já foi paga
+    const cardPaidThisMonth = cardPayments.some(p => p.month === mKey);
+
     return {
       spentMonth, spentWeek, spentToday, incomeMonth,
       remainingMonth: budget.monthly - spentMonth,
       remainingWeek: budget.weekly - spentWeek,
       owedToMe, iOwe, billsPending,
       accountsTotal, netWorth,
+      cardThisMonth: cardThisMonth.total,
+      cardThisMonthItems: cardThisMonth.items,
+      cardNextMonth: cardNextMonthData.total,
+      cardNextMonthItems: cardNextMonthData.items,
+      cardPaidThisMonth,
+      currentMonth: mKey,
     };
-  }, [transactions, debts, bills, budget, accounts]);
+  }, [transactions, debts, bills, budget, accounts, cardPurchases, cardPayments]);
 
   /* ----- Export / Import ----- */
   const exportData = useCallback(async () => {
     const data = {
-      version: 2, exportedAt: new Date().toISOString(),
-      transactions, debts, bills, accounts, budget,
+      version: 3, exportedAt: new Date().toISOString(),
+      transactions, debts, bills, accounts, cardPurchases, cardPayments, budget,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -850,7 +1172,7 @@ function App() {
     a.href = url; a.download = `strix-backup-${todayISO()}.json`;
     a.click(); URL.revokeObjectURL(url);
     flash('Backup baixado');
-  }, [transactions, debts, bills, accounts, budget, flash]);
+  }, [transactions, debts, bills, accounts, cardPurchases, cardPayments, budget, flash]);
 
   const importData = useCallback(async (file) => {
     try {
@@ -860,11 +1182,13 @@ function App() {
       // Limpa tudo
       const db = await openDB();
       await new Promise((res, rej) => {
-        const tx = db.transaction(['transactions','debts','bills','accounts','meta'], 'readwrite');
+        const tx = db.transaction(['transactions','debts','bills','accounts','cardPurchases','cardPayments','meta'], 'readwrite');
         tx.objectStore('transactions').clear();
         tx.objectStore('debts').clear();
         tx.objectStore('bills').clear();
         tx.objectStore('accounts').clear();
+        tx.objectStore('cardPurchases').clear();
+        tx.objectStore('cardPayments').clear();
         tx.objectStore('meta').delete('budget');
         tx.oncomplete = () => res();
         tx.onerror = () => rej(tx.error);
@@ -873,11 +1197,15 @@ function App() {
       for (const d of (data.debts || [])) await dbPut('debts', { ...d, personKey: stripAccents((d.person||'').toLowerCase()) });
       for (const b of (data.bills || [])) await dbPut('bills', b);
       for (const a of (data.accounts || [])) await dbPut('accounts', { ...a, nameKey: stripAccents((a.name||'').toLowerCase()) });
+      for (const c of (data.cardPurchases || [])) await dbPut('cardPurchases', c);
+      for (const cp of (data.cardPayments || [])) await dbPut('cardPayments', cp);
       if (data.budget) await dbPut('meta', { key: 'budget', value: data.budget });
       setTransactions(data.transactions || []);
       setDebts(data.debts || []);
       setBills(data.bills || []);
       setAccounts(data.accounts || []);
+      setCardPurchases(data.cardPurchases || []);
+      setCardPayments(data.cardPayments || []);
       if (data.budget) setBudget(data.budget);
       flash('Dados restaurados');
     } catch (e) {
@@ -953,15 +1281,43 @@ function App() {
     // Conteúdo
     h('div', { style: { maxWidth: 480, margin: '0 auto', padding: '0 16px' } },
       tab === 'home' && h(HomeTab, {
-        t, theme, styles, summary, budget, transactions,
+        t, theme, styles, summary, budget, transactions, accounts,
         onCommand: handleCommand, startVoice,
         onRemoveTx: async (id) => { await removeTx(id); flash('Removido'); },
+        onEditTx: (tx) => setEditing({ kind: 'tx', item: tx }),
+        onEditBudget: (val) => { setBudget(b => ({ ...b, monthly: val, month: monthKey() })); flash(`Orçamento: ${fmt(val)}`); },
+        onPayCard: async () => {
+          if (summary.cardThisMonth === 0) return;
+          if (!confirm(`Pagar fatura de ${fmt(summary.cardThisMonth)}?`)) return;
+          await payCard(summary.cardThisMonth, summary.currentMonth);
+          flash(`Fatura paga: ${fmt(summary.cardThisMonth)} ✓`);
+        },
+        onViewCard: () => setTab('card'),
         askNotifPermission,
+      }),
+      tab === 'card' && h(CardTab, {
+        t, styles, cardPurchases, cardPayments, summary,
+        onCommand: handleCommand,
+        onPayCard: async () => {
+          if (summary.cardThisMonth === 0) return;
+          if (!confirm(`Pagar fatura de ${fmt(summary.cardThisMonth)}?`)) return;
+          await payCard(summary.cardThisMonth, summary.currentMonth);
+          flash(`Fatura paga: ${fmt(summary.cardThisMonth)} ✓`);
+        },
+        removeCardPurchase: async (id) => {
+          if (!confirm('Apagar esta compra do cartão? Todas as parcelas serão removidas.')) return;
+          await removeCardPurchase(id); flash('Compra removida');
+        },
+        toggleActive: (id) => {
+          const p = cardPurchases.find(x => x.id === id);
+          if (p) updateCardPurchase(id, { active: !p.active });
+        },
       }),
       tab === 'wealth' && h(WealthTab, {
         t, styles, accounts, transactions, summary,
         onCommand: handleCommand,
         toggleArchive: (id) => updateAccount(id, { archived: !accounts.find(a=>a.id===id)?.archived }),
+        onEdit: (acc) => setEditing({ kind: 'account', item: acc }),
         removeAccount: async (id) => {
           const acc = accounts.find(a => a.id === id);
           if (!acc) return;
@@ -983,17 +1339,34 @@ function App() {
         t, theme, styles, transactions, summary,
       }),
       tab === 'details' && h(DetailsTab, {
-        t, styles, debts, bills, transactions,
+        t, styles, debts, bills, transactions, accounts,
         toggleDebt: (id) => updateDebt(id, { paid: !debts.find(d=>d.id===id)?.paid, paidDate: todayISO() }),
         toggleBill: (id) => updateBill(id, { paid: !bills.find(b=>b.id===id)?.paid, paidDate: todayISO() }),
         removeDebt: async (id) => { await removeDebt(id); flash('Removido'); },
         removeBill: async (id) => { await removeBill(id); flash('Removido'); },
         removeTx: async (id) => { await removeTx(id); flash('Removido'); },
+        onEditTx: (tx) => setEditing({ kind: 'tx', item: tx }),
+        onEditDebt: (d) => setEditing({ kind: 'debt', item: d }),
+        onEditBill: (b) => setEditing({ kind: 'bill', item: b }),
       }),
       tab === 'settings' && h(SettingsTab, {
         t, styles, theme, setTheme, exportData, importData, askNotifPermission,
       })
     ),
+
+    // EDIT MODAL
+    editing && h(EditModal, {
+      t, theme, editing, setEditing, accounts,
+      onSave: async (patch) => {
+        const { kind, item } = editing;
+        if (kind === 'tx') await updateTx(item.id, patch);
+        if (kind === 'debt') await updateDebt(item.id, patch);
+        if (kind === 'bill') await updateBill(item.id, patch);
+        if (kind === 'account') await updateAccount(item.id, patch);
+        setEditing(null);
+        flash('Atualizado');
+      },
+    }),
 
     // Toast com undo
     feedback && h('div', {
@@ -1072,11 +1445,17 @@ function makeStyles(t, theme) {
       cursor: 'pointer', color: t.text, fontSize: 18,
     },
     card: {
-      background: t.surface, borderRadius: 18, padding: 16,
+      background: t.surface, borderRadius: 18, padding: '16px 18px',
       border: `1px solid ${t.border}`,
     },
-    cardTitle: { fontSize: 12, fontWeight: 500, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 },
-    bigNumber: { fontSize: 36, fontWeight: 700, letterSpacing: '-0.02em', lineHeight: 1.1 },
+    cardTitle: {
+      fontSize: 11, fontWeight: 500, color: t.textDim,
+      textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10,
+    },
+    bigNumber: {
+      fontSize: 34, fontWeight: 600, letterSpacing: '-0.025em',
+      lineHeight: 1.1, fontVariantNumeric: 'tabular-nums',
+    },
     tabBar: {
       position: 'fixed',
       bottom: `calc(env(safe-area-inset-bottom) + 12px)`,
@@ -1131,9 +1510,11 @@ const GlobalStyles = memo(function GlobalStyles({ t, theme }) {
 });
 
 /* ===================== HOME ===================== */
-const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, transactions, onCommand, startVoice, onRemoveTx, askNotifPermission }) {
+const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, transactions, accounts, onCommand, startVoice, onRemoveTx, onEditTx, onEditBudget, askNotifPermission, onPayCard, onViewCard }) {
   const [input, setInput] = useState('');
   const [listening, setListening] = useState(false);
+  const [editingBudget, setEditingBudget] = useState(false);
+  const [budgetDraft, setBudgetDraft] = useState('');
 
   const todayTx = useMemo(() => {
     const today = todayISO();
@@ -1155,11 +1536,19 @@ const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, trans
   const remainingPct = budget.monthly > 0
     ? Math.max(0, Math.min(100, (summary.remainingMonth / budget.monthly) * 100)) : 0;
 
+  const saveBudget = () => {
+    const val = parseAmount(budgetDraft);
+    if (val !== null && val >= 0) {
+      onEditBudget(val);
+      setEditingBudget(false);
+    }
+  };
+
   const examples = useMemo(() => [
     'gastei 30 em gasolina',
-    'esse mês posso gastar 2500',
+    'comprei algo de 600 no cartão em 3x',
+    'paguei o cartão',
     'joão me deve 50',
-    'paguei a conta da Oi',
   ], []);
 
   const handleVoice = useCallback(() => {
@@ -1168,7 +1557,7 @@ const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, trans
   }, [startVoice]);
 
   return h('div', { className: 'strix-fade' },
-    // Hero saldo
+    // Hero: orçamento + saldo disponível (EDITÁVEL)
     h('div', { style: { ...styles.card, marginBottom: 12, position: 'relative', overflow: 'hidden' } },
       h('div', {
         style: {
@@ -1177,40 +1566,107 @@ const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, trans
           pointerEvents: 'none',
         }
       }),
-      h('div', { style: styles.cardTitle }, 'Disponível este mês'),
-      h('div', { style: { ...styles.bigNumber, color: summary.remainingMonth >= 0 ? t.text : t.danger } },
-        budget.monthly > 0 ? fmt(summary.remainingMonth) : fmt(0)),
-      budget.monthly > 0 && h('div', { style: { marginTop: 12 } },
-        h('div', { style: { height: 6, borderRadius: 3, background: t.surfaceHi, overflow: 'hidden' } },
-          h('div', {
-            style: {
-              height: '100%', width: `${remainingPct}%`,
-              background: `linear-gradient(90deg, ${t.accent}, ${t.accentDim})`,
-              borderRadius: 3, transition: 'width 0.5s ease',
-            }
-          })
-        ),
-        h('div', { style: { display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12, color: t.textDim } },
-          h('span', null, `Gastei ${fmt(summary.spentMonth)}`),
-          h('span', null, `Limite ${fmt(budget.monthly)}`)
-        )
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' } },
+        h('div', { style: styles.cardTitle }, 'Disponível este mês'),
+        h('button', {
+          onClick: () => { setBudgetDraft(String(budget.monthly || '')); setEditingBudget(true); },
+          style: {
+            background: 'transparent', border: 'none', color: t.accent,
+            fontSize: 11, fontWeight: 600, cursor: 'pointer',
+            textTransform: 'uppercase', letterSpacing: '0.06em',
+          }
+        }, budget.monthly > 0 ? '✎ ajustar' : '+ definir')
       ),
-      !budget.monthly && h('div', { style: { fontSize: 12, color: t.textDim, marginTop: 8 } },
-        'Defina um orçamento dizendo "esse mês posso gastar X"'
-      )
+      editingBudget
+        ? h('div', { style: { marginTop: 8 } },
+            h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+              h('span', { style: { fontSize: 24, fontWeight: 600, color: t.textDim } }, 'R$'),
+              h('input', {
+                autoFocus: true,
+                type: 'text',
+                inputMode: 'decimal',
+                value: budgetDraft,
+                onChange: (e) => setBudgetDraft(e.target.value),
+                onKeyDown: (e) => { if (e.key === 'Enter') saveBudget(); if (e.key === 'Escape') setEditingBudget(false); },
+                style: {
+                  flex: 1, fontSize: 28, fontWeight: 600, color: t.text,
+                  background: 'transparent', border: 'none', outline: 'none',
+                  fontVariantNumeric: 'tabular-nums',
+                  fontFamily: 'inherit', letterSpacing: '-0.02em',
+                  borderBottom: `2px solid ${t.accent}`, paddingBottom: 2,
+                },
+              })
+            ),
+            h('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
+              h('button', {
+                onClick: saveBudget,
+                style: { ...styles.primaryBtn, flex: 1, padding: '10px' }
+              }, 'Salvar'),
+              h('button', {
+                onClick: () => setEditingBudget(false),
+                style: {
+                  flex: 1, padding: '10px', borderRadius: 12,
+                  background: t.surfaceHi, color: t.text, border: `1px solid ${t.border}`,
+                  fontWeight: 500, fontSize: 14, cursor: 'pointer',
+                }
+              }, 'Cancelar')
+            )
+          )
+        : h(Fragment, null,
+            h('div', {
+              style: {
+                ...styles.bigNumber, color: summary.remainingMonth >= 0 ? t.text : t.danger,
+                fontVariantNumeric: 'tabular-nums',
+              }
+            }, budget.monthly > 0 ? fmt(summary.remainingMonth) : 'R$ 0,00'),
+            budget.monthly > 0 && h('div', { style: { marginTop: 14 } },
+              h('div', { style: { height: 6, borderRadius: 3, background: t.surfaceHi, overflow: 'hidden' } },
+                h('div', {
+                  style: {
+                    height: '100%', width: `${remainingPct}%`,
+                    background: `linear-gradient(90deg, ${t.accent}, ${t.accentDim})`,
+                    borderRadius: 3, transition: 'width 0.5s ease',
+                  }
+                })
+              ),
+              h('div', {
+                style: {
+                  display: 'flex', justifyContent: 'space-between',
+                  marginTop: 8, fontSize: 12, color: t.textDim,
+                  fontVariantNumeric: 'tabular-nums',
+                }
+              },
+                h('span', null, `Gastei ${fmt(summary.spentMonth)}`),
+                h('span', null, `Limite ${fmt(budget.monthly)}`)
+              )
+            ),
+            !budget.monthly && h('div', { style: { fontSize: 12, color: t.textDim, marginTop: 8 } },
+              'Toque em "+ definir" ou diga "esse mês posso gastar X"'
+            )
+          )
     ),
-    // Stat row
+    // Stat row: Hoje + Semana
     h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 } },
       h('div', { style: styles.card },
         h('div', { style: styles.cardTitle }, 'Hoje'),
-        h('div', { style: { ...styles.bigNumber, fontSize: 22 } }, fmt(summary.spentToday))
+        h('div', { style: { ...styles.bigNumber, fontSize: 22, fontVariantNumeric: 'tabular-nums' } }, fmt(summary.spentToday))
       ),
       h('div', { style: styles.card },
-        h('div', { style: styles.cardTitle }, 'Semana'),
-        h('div', { style: { ...styles.bigNumber, fontSize: 22, color: budget.weekly > 0 && summary.remainingWeek < 0 ? t.danger : t.text } },
-          budget.weekly > 0 ? fmt(summary.remainingWeek) : fmt(summary.spentWeek))
+        h('div', { style: styles.cardTitle }, budget.weekly > 0 ? 'Restam na semana' : 'Gasto na semana'),
+        h('div', {
+          style: {
+            ...styles.bigNumber, fontSize: 22,
+            color: budget.weekly > 0 && summary.remainingWeek < 0 ? t.danger : t.text,
+            fontVariantNumeric: 'tabular-nums',
+          }
+        }, budget.weekly > 0 ? fmt(summary.remainingWeek) : fmt(summary.spentWeek))
       )
     ),
+    // CARD CARTÃO DE CRÉDITO (sempre visível, separado do orçamento)
+    h(CardSummaryBlock, {
+      t, styles, summary,
+      onPayCard, onViewCard,
+    }),
     // Captura
     h('div', { style: { ...styles.card, marginBottom: 12 } },
       h('div', { style: styles.cardTitle }, 'Captura rápida'),
@@ -1246,11 +1702,11 @@ const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, trans
     h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 } },
       h('div', { style: styles.card },
         h('div', { style: styles.cardTitle }, 'Te devem'),
-        h('div', { style: { fontSize: 22, fontWeight: 700, color: t.success } }, fmt(summary.owedToMe))
+        h('div', { style: { fontSize: 22, fontWeight: 600, color: t.success, fontVariantNumeric: 'tabular-nums' } }, fmt(summary.owedToMe))
       ),
       h('div', { style: styles.card },
         h('div', { style: styles.cardTitle }, 'Você deve'),
-        h('div', { style: { fontSize: 22, fontWeight: 700, color: t.danger } }, fmt(summary.iOwe + summary.billsPending))
+        h('div', { style: { fontSize: 22, fontWeight: 600, color: t.danger, fontVariantNumeric: 'tabular-nums' } }, fmt(summary.iOwe + summary.billsPending))
       )
     ),
     // Hoje
@@ -1259,17 +1715,90 @@ const HomeTab = memo(function HomeTab({ t, theme, styles, summary, budget, trans
       todayTx.length === 0
         ? h('div', { style: { padding: '24px 8px', textAlign: 'center', color: t.textFaint, fontSize: 14 } },
             'Nenhum lançamento hoje. Capture um agora.')
-        : todayTx.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => onRemoveTx(tx.id) }))
+        : todayTx.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => onRemoveTx(tx.id), onEdit: () => onEditTx && onEditTx(tx) }))
     ),
     // Recentes
     recentTx.length > 0 && h('div', { style: styles.card },
       h('div', { style: styles.cardTitle }, 'Recentes'),
-      recentTx.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => onRemoveTx(tx.id) }))
+      recentTx.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => onRemoveTx(tx.id), onEdit: () => onEditTx && onEditTx(tx) }))
     )
   );
 });
 
-const TxRow = memo(function TxRow({ tx, t, onDelete }) {
+// Bloco de cartão de crédito — sempre visível na home
+const CardSummaryBlock = memo(function CardSummaryBlock({ t, styles, summary, onPayCard, onViewCard }) {
+  const { cardThisMonth, cardNextMonth, cardPaidThisMonth, currentMonth } = summary;
+  // Se não há compras ativas em nenhum mês, mostra um card mais sutil
+  if (cardThisMonth === 0 && cardNextMonth === 0) {
+    return h('div', {
+      style: {
+        ...styles.card, marginBottom: 12,
+        borderStyle: 'dashed', borderColor: t.border,
+        cursor: 'pointer',
+      },
+      onClick: onViewCard,
+    },
+      h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+        h('div', null,
+          h('div', { style: styles.cardTitle }, 'Cartão de crédito'),
+          h('div', { style: { fontSize: 13, color: t.textDim, marginTop: 4 } },
+            'Nenhuma compra parcelada')
+        ),
+        h('div', { style: { color: t.accent, fontSize: 20 } }, '+')
+      )
+    );
+  }
+  return h('div', {
+    style: { ...styles.card, marginBottom: 12, cursor: 'pointer' },
+    onClick: onViewCard,
+  },
+    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 } },
+      h('div', { style: styles.cardTitle }, 'Cartão de crédito'),
+      cardPaidThisMonth && h('span', {
+        style: {
+          fontSize: 10, fontWeight: 600, padding: '3px 8px',
+          background: 'rgba(48,209,88,0.15)', color: t.success,
+          borderRadius: 8, textTransform: 'uppercase', letterSpacing: '0.04em',
+        }
+      }, '✓ paga')
+    ),
+    h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+      h('div', null,
+        h('div', { style: { fontSize: 10, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 } },
+          cardPaidThisMonth ? `${monthLabel(currentMonth)} (paga)` : `${monthLabel(currentMonth)}`),
+        h('div', {
+          style: {
+            fontSize: 22, fontWeight: 600,
+            color: cardPaidThisMonth ? t.textDim : t.text,
+            textDecoration: cardPaidThisMonth ? 'line-through' : 'none',
+            fontVariantNumeric: 'tabular-nums',
+          }
+        }, fmt(cardThisMonth))
+      ),
+      h('div', null,
+        h('div', { style: { fontSize: 10, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 } },
+          monthLabel(nextMonth(currentMonth))),
+        h('div', {
+          style: {
+            fontSize: 22, fontWeight: 600, color: t.accent,
+            fontVariantNumeric: 'tabular-nums',
+          }
+        }, fmt(cardNextMonth))
+      )
+    ),
+    !cardPaidThisMonth && cardThisMonth > 0 && h('button', {
+      onClick: (e) => { e.stopPropagation(); onPayCard(); },
+      style: {
+        marginTop: 12, width: '100%', padding: '10px',
+        borderRadius: 12, border: `1px solid ${t.accent}`,
+        background: 'transparent', color: t.accent,
+        fontSize: 13, fontWeight: 600, cursor: 'pointer',
+      }
+    }, `Pagar fatura ${fmt(cardThisMonth)}`)
+  );
+});
+
+const TxRow = memo(function TxRow({ tx, t, onDelete, onEdit }) {
   const isExp = tx.type === 'expense';
   return h('div', {
     style: {
@@ -1285,7 +1814,10 @@ const TxRow = memo(function TxRow({ tx, t, onDelete }) {
         color: isExp ? t.accent : t.success, fontSize: 16, fontWeight: 700,
       }
     }, isExp ? '−' : '+'),
-    h('div', { style: { flex: 1, minWidth: 0 } },
+    h('div', {
+      onClick: onEdit,
+      style: { flex: 1, minWidth: 0, cursor: onEdit ? 'pointer' : 'default' }
+    },
       h('div', {
         style: {
           fontSize: 14, fontWeight: 500, color: t.text,
@@ -1296,6 +1828,11 @@ const TxRow = memo(function TxRow({ tx, t, onDelete }) {
         `${tx.category} · ${new Date(tx.date + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' })}`)
     ),
     h('div', { style: { fontSize: 15, fontWeight: 600, color: isExp ? t.text : t.success } }, fmt(tx.amount)),
+    onEdit && h('button', {
+      onClick: onEdit,
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
+      title: 'Editar',
+    }, '✎'),
     h('button', {
       onClick: () => { if (confirm('Remover este lançamento?')) onDelete(); },
       style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18, padding: 4 }
@@ -1304,7 +1841,7 @@ const TxRow = memo(function TxRow({ tx, t, onDelete }) {
 });
 
 /* ===================== WEALTH (Patrimônio) ===================== */
-const WealthTab = memo(function WealthTab({ t, styles, accounts, transactions, summary, onCommand, toggleArchive, removeAccount }) {
+const WealthTab = memo(function WealthTab({ t, styles, accounts, transactions, summary, onCommand, toggleArchive, removeAccount, onEdit }) {
   const [input, setInput] = useState('');
 
   const activeAccounts = useMemo(() =>
@@ -1403,6 +1940,7 @@ const WealthTab = memo(function WealthTab({ t, styles, accounts, transactions, s
             key: a.id, account: a, t,
             onArchive: () => toggleArchive(a.id),
             onDelete: () => removeAccount(a.id),
+            onEdit: () => onEdit && onEdit(a),
           }))
     ),
 
@@ -1413,12 +1951,13 @@ const WealthTab = memo(function WealthTab({ t, styles, accounts, transactions, s
         key: a.id, account: a, t, archived: true,
         onArchive: () => toggleArchive(a.id),
         onDelete: () => removeAccount(a.id),
+        onEdit: () => onEdit && onEdit(a),
       }))
     )
   );
 });
 
-const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, onDelete }) {
+const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, onDelete, onEdit }) {
   return h('div', {
     style: {
       display: 'flex', alignItems: 'center', gap: 12,
@@ -1434,7 +1973,10 @@ const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, o
         color: account.balance >= 0 ? t.success : t.accent, fontSize: 14, fontWeight: 600, flexShrink: 0,
       }
     }, '◈'),
-    h('div', { style: { flex: 1, minWidth: 0 } },
+    h('div', {
+      onClick: onEdit,
+      style: { flex: 1, minWidth: 0, cursor: onEdit ? 'pointer' : 'default' }
+    },
       h('div', {
         style: {
           fontSize: 14, fontWeight: 600, color: t.text, textTransform: 'capitalize',
@@ -1447,6 +1989,11 @@ const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, o
     h('div', {
       style: { fontSize: 15, fontWeight: 700, color: account.balance >= 0 ? t.text : t.danger }
     }, fmt(account.balance)),
+    onEdit && h('button', {
+      onClick: onEdit,
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
+      title: 'Editar',
+    }, '✎'),
     h('button', {
       onClick: onArchive,
       style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
@@ -1459,24 +2006,267 @@ const AccountRow = memo(function AccountRow({ account, t, archived, onArchive, o
   );
 });
 
+/* ===================== CARD (Cartão de crédito) ===================== */
+const CardTab = memo(function CardTab({ t, styles, cardPurchases, cardPayments, summary, onCommand, onPayCard, removeCardPurchase, toggleActive }) {
+  const [input, setInput] = useState('');
+  const [viewMonth, setViewMonth] = useState(summary.currentMonth);
+
+  const monthData = useMemo(() => cardTotalForMonth(cardPurchases, viewMonth), [cardPurchases, viewMonth]);
+  const monthPayment = useMemo(() => cardPayments.find(p => p.month === viewMonth), [cardPayments, viewMonth]);
+
+  // Próximos 6 meses para navegação
+  const nextSixMonths = useMemo(() => {
+    const arr = [];
+    let m = summary.currentMonth;
+    for (let i = 0; i < 6; i++) { arr.push(m); m = nextMonth(m); }
+    return arr;
+  }, [summary.currentMonth]);
+
+  const activePurchases = cardPurchases.filter(p => p.active);
+  const archivedPurchases = cardPurchases.filter(p => !p.active);
+
+  const submit = () => {
+    if (!input.trim()) return;
+    onCommand(input); setInput('');
+  };
+
+  return h('div', { className: 'strix-fade' },
+    // Hero
+    h('div', { style: { ...styles.card, marginBottom: 12, position: 'relative', overflow: 'hidden' } },
+      h('div', {
+        style: {
+          position: 'absolute', top: -40, right: -40, width: 160, height: 160, borderRadius: '50%',
+          background: `radial-gradient(circle, ${t.accentSoft} 0%, transparent 70%)`, pointerEvents: 'none',
+        }
+      }),
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' } },
+        h('div', { style: styles.cardTitle }, `Fatura · ${monthLabel(viewMonth)}`),
+        monthPayment && h('span', {
+          style: {
+            fontSize: 10, fontWeight: 600, padding: '3px 8px',
+            background: 'rgba(48,209,88,0.15)', color: t.success,
+            borderRadius: 8, textTransform: 'uppercase', letterSpacing: '0.04em',
+          }
+        }, '✓ paga')
+      ),
+      h('div', {
+        style: {
+          ...styles.bigNumber,
+          color: monthPayment ? t.textDim : t.text,
+          textDecoration: monthPayment ? 'line-through' : 'none',
+          fontVariantNumeric: 'tabular-nums',
+        }
+      }, fmt(monthData.total)),
+      h('div', { style: { fontSize: 12, color: t.textDim, marginTop: 6 } },
+        `${monthData.items.length} ${monthData.items.length === 1 ? 'parcela' : 'parcelas'}`
+      ),
+      !monthPayment && viewMonth === summary.currentMonth && monthData.total > 0 && h('button', {
+        onClick: onPayCard,
+        style: {
+          marginTop: 14, width: '100%', padding: '12px',
+          borderRadius: 12, background: t.accent, color: '#fff',
+          border: 'none', fontSize: 14, fontWeight: 600, cursor: 'pointer',
+        }
+      }, `Pagar ${fmt(monthData.total)}`)
+    ),
+
+    // Navegação por mês
+    h('div', { style: { ...styles.card, marginBottom: 12, padding: 8 } },
+      h('div', {
+        style: {
+          display: 'flex', gap: 4, overflowX: 'auto',
+          scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch',
+        }
+      },
+        nextSixMonths.map(m => {
+          const data = cardTotalForMonth(cardPurchases, m);
+          const isPaid = cardPayments.some(p => p.month === m);
+          const active = m === viewMonth;
+          return h('button', {
+            key: m, onClick: () => setViewMonth(m),
+            style: {
+              flexShrink: 0, padding: '8px 12px', borderRadius: 10,
+              background: active ? t.accent : t.surfaceHi,
+              color: active ? '#fff' : t.text,
+              border: 'none', cursor: 'pointer',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
+              minWidth: 72,
+            },
+          },
+            h('div', { style: { fontSize: 10, fontWeight: 600, opacity: 0.7, textTransform: 'uppercase' } },
+              monthLabel(m).split(' ')[0].slice(0, 3)),
+            h('div', { style: { fontSize: 13, fontWeight: 600, fontVariantNumeric: 'tabular-nums' } },
+              data.total > 0 ? fmt(data.total).replace('R$ ', '') : '—'),
+            isPaid && h('div', { style: { fontSize: 8, opacity: 0.7 } }, '✓')
+          );
+        })
+      )
+    ),
+
+    // Parcelas do mês visto
+    monthData.items.length > 0 && h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, 'Parcelas neste mês'),
+      monthData.items.map(item => {
+        const p = cardPurchases.find(x => x.id === item.purchaseId);
+        return h('div', {
+          key: item.purchaseId,
+          style: {
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: '12px 0', borderBottom: `1px solid ${t.border}`,
+          }
+        },
+          h('div', {
+            style: {
+              width: 36, height: 36, borderRadius: 12,
+              background: t.accentSoft, color: t.accent,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 700,
+            }
+          }, `${item.installment}/${item.of}`),
+          h('div', { style: { flex: 1, minWidth: 0 } },
+            h('div', {
+              style: {
+                fontSize: 14, fontWeight: 500, color: t.text,
+                textTransform: 'capitalize', overflow: 'hidden',
+                textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }
+            }, item.description),
+            h('div', { style: { fontSize: 11, color: t.textDim, marginTop: 2 } },
+              `Total ${fmt(p?.amount || 0)} em ${item.of}x`)
+          ),
+          h('div', {
+            style: { fontSize: 15, fontWeight: 600, color: t.text, fontVariantNumeric: 'tabular-nums' }
+          }, fmt(item.amount))
+        );
+      })
+    ),
+
+    // Adicionar
+    h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, 'Lançar compra no cartão'),
+      h('input', {
+        style: styles.input,
+        placeholder: 'Ex: "comprei tênis de 600 no cartão em 3x"',
+        value: input, onChange: (e) => setInput(e.target.value),
+        onKeyDown: (e) => e.key === 'Enter' && submit(),
+      }),
+      h('button', {
+        style: { ...styles.primaryBtn, marginTop: 10, width: '100%', opacity: input.trim() ? 1 : 0.5 },
+        onClick: submit, disabled: !input.trim(),
+      }, 'Registrar'),
+      h('div', { style: { marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 6 } },
+        [
+          'comprei tênis de 600 no cartão em 3x',
+          'passei 1200 no cartão em 6x',
+          'paguei o cartão',
+        ].map(s => h('button', {
+          key: s, onClick: () => setInput(s),
+          style: {
+            fontSize: 11, padding: '6px 10px', borderRadius: 10,
+            background: t.surfaceHi, color: t.textDim,
+            border: `1px solid ${t.border}`, cursor: 'pointer',
+          }
+        }, s))
+      )
+    ),
+
+    // Compras ativas (todas, com indicador de progresso)
+    activePurchases.length > 0 && h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, `Compras ativas · ${activePurchases.length}`),
+      activePurchases.slice().reverse().map(p => h(CardPurchaseRow, {
+        key: p.id, purchase: p, t, currentMonth: summary.currentMonth,
+        onToggle: () => toggleActive(p.id),
+        onDelete: () => removeCardPurchase(p.id),
+      }))
+    ),
+
+    // Compras arquivadas
+    archivedPurchases.length > 0 && h('div', { style: styles.card },
+      h('div', { style: styles.cardTitle }, `Arquivadas · ${archivedPurchases.length}`),
+      archivedPurchases.slice().reverse().map(p => h(CardPurchaseRow, {
+        key: p.id, purchase: p, t, currentMonth: summary.currentMonth, archived: true,
+        onToggle: () => toggleActive(p.id),
+        onDelete: () => removeCardPurchase(p.id),
+      }))
+    )
+  );
+});
+
+const CardPurchaseRow = memo(function CardPurchaseRow({ purchase, t, currentMonth, archived, onToggle, onDelete }) {
+  // Quantas parcelas já passaram em relação ao mês atual
+  const installments = cardInstallmentsFor(purchase);
+  const idx = installments.findIndex(i => i.month === currentMonth);
+  const paidCount = idx >= 0 ? idx : (currentMonth > installments[installments.length - 1].month ? purchase.installments : 0);
+  const pct = (paidCount / purchase.installments) * 100;
+
+  return h('div', {
+    style: {
+      padding: '12px 0', borderBottom: `1px solid ${t.border}`,
+      opacity: archived ? 0.5 : 1,
+    }
+  },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 } },
+      h('div', { style: { flex: 1, minWidth: 0 } },
+        h('div', {
+          style: {
+            fontSize: 14, fontWeight: 600, color: t.text, textTransform: 'capitalize',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }
+        }, purchase.description),
+        h('div', { style: { fontSize: 11, color: t.textDim, marginTop: 2 } },
+          `${fmt(purchase.amount)} em ${purchase.installments}x de ${fmt(purchase.amount / purchase.installments)}`)
+      ),
+      h('button', {
+        onClick: onToggle,
+        style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14 },
+        title: archived ? 'Reativar' : 'Arquivar',
+      }, archived ? '↑' : '↓'),
+      h('button', {
+        onClick: onDelete,
+        style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18 }
+      }, '×')
+    ),
+    h('div', { style: { height: 3, borderRadius: 2, background: t.surfaceHi, overflow: 'hidden' } },
+      h('div', {
+        style: {
+          height: '100%', width: `${pct}%`,
+          background: t.accent, borderRadius: 2,
+        }
+      })
+    ),
+    h('div', { style: { fontSize: 10, color: t.textDim, marginTop: 4, fontVariantNumeric: 'tabular-nums' } },
+      `${paidCount}/${purchase.installments} pagas`)
+  );
+});
+
 /* ===================== DASHBOARD ===================== */
 const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions, summary }) {
   const [chartType, setChartType] = useState('area');
   const [period, setPeriod] = useState('30');
+  const [drillCategory, setDrillCategory] = useState(null); // null ou nome categoria
+  const [compareMonths, setCompareMonths] = useState(false);
 
   const days = parseInt(period);
 
+  // Lista de meses com dados (decrescente)
+  const monthsWithData = useMemo(() => {
+    const set = new Set();
+    for (const tx of transactions) if (tx.month) set.add(tx.month);
+    return [...set].sort().reverse();
+  }, [transactions]);
+
+  // Dados para o gráfico principal — filtra por categoria se em drill
   const chartData = useMemo(() => {
-    // Indexa transações por data uma vez
     const byDate = new Map();
     for (const tx of transactions) {
+      if (drillCategory && tx.category !== drillCategory) continue;
       if (!byDate.has(tx.date)) byDate.set(tx.date, { exp: 0, inc: 0 });
       const slot = byDate.get(tx.date);
       if (tx.type === 'expense') slot.exp += tx.amount;
       else if (tx.type === 'income') slot.inc += tx.amount;
     }
     const result = [];
-    const today = new Date(); today.setHours(0,0,0,0);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(today); d.setDate(d.getDate() - i);
       const key = d.toISOString().split('T')[0];
@@ -1487,36 +2277,106 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
       });
     }
     return result;
-  }, [transactions, days]);
+  }, [transactions, days, drillCategory]);
 
+  // Categorias do mês atual (para drill-down)
   const categoryData = useMemo(() => {
     const map = new Map();
+    const mKey = summary.currentMonth;
     for (const tx of transactions) {
       if (tx.type !== 'expense') continue;
+      if (tx.month !== mKey) continue;
       const c = tx.category || 'Outros';
       map.set(c, (map.get(c) || 0) + tx.amount);
     }
     return [...map.entries()].map(([name, value]) => ({ name, value }))
       .sort((a, b) => b.value - a.value);
-  }, [transactions]);
+  }, [transactions, summary.currentMonth]);
+
+  // Comparação: mês atual vs anterior
+  const monthCompare = useMemo(() => {
+    const cur = summary.currentMonth;
+    const prev = prevMonth(cur);
+    const curByCat = new Map();
+    const prevByCat = new Map();
+    let curTotal = 0, prevTotal = 0;
+    for (const tx of transactions) {
+      if (tx.type !== 'expense') continue;
+      const c = tx.category || 'Outros';
+      if (tx.month === cur) { curByCat.set(c, (curByCat.get(c) || 0) + tx.amount); curTotal += tx.amount; }
+      else if (tx.month === prev) { prevByCat.set(c, (prevByCat.get(c) || 0) + tx.amount); prevTotal += tx.amount; }
+    }
+    const cats = new Set([...curByCat.keys(), ...prevByCat.keys()]);
+    const rows = [...cats].map(c => ({
+      name: c,
+      cur: curByCat.get(c) || 0,
+      prev: prevByCat.get(c) || 0,
+      delta: (curByCat.get(c) || 0) - (prevByCat.get(c) || 0),
+    })).sort((a, b) => b.cur - a.cur);
+    return { rows, curTotal, prevTotal, prev, cur };
+  }, [transactions, summary.currentMonth]);
+
+  // Transações da categoria em drill
+  const drillTransactions = useMemo(() => {
+    if (!drillCategory) return [];
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const cutoff = new Date(today); cutoff.setDate(cutoff.getDate() - days);
+    return transactions
+      .filter(tx => tx.type === 'expense' && tx.category === drillCategory && new Date(tx.date) >= cutoff)
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [transactions, drillCategory, days]);
+
+  // Gasto por dia da semana
+  const byWeekday = useMemo(() => {
+    const labels = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
+    const sums = [0, 0, 0, 0, 0, 0, 0];
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const cutoff = new Date(today); cutoff.setDate(cutoff.getDate() - days);
+    for (const tx of transactions) {
+      if (tx.type !== 'expense') continue;
+      if (drillCategory && tx.category !== drillCategory) continue;
+      const d = new Date(tx.date + 'T00:00:00');
+      if (d < cutoff) continue;
+      sums[d.getDay()] += tx.amount;
+    }
+    return labels.map((l, i) => ({ day: l, value: sums[i] }));
+  }, [transactions, days, drillCategory]);
 
   const COLORS = useMemo(() => [t.accent, t.accentDim, '#ff8a80', '#ffb3a7', '#ffd0c2', '#ffe5dd', '#8e8e93'],
     [t.accent, t.accentDim]);
-
-  // ID único de gradient por tema (evita conflito ao trocar tema)
   const gradId = `g-${theme}`;
 
   return h('div', { className: 'strix-fade' },
+    // KPIs
     h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 } },
       h(KPI, { t, label: 'Gasto mês', value: fmt(summary.spentMonth), accent: t.accent }),
       h(KPI, { t, label: 'Receita mês', value: fmt(summary.incomeMonth), accent: t.success }),
       h(KPI, { t, label: 'A receber', value: fmt(summary.owedToMe), accent: t.success }),
       h(KPI, { t, label: 'A pagar', value: fmt(summary.iOwe + summary.billsPending), accent: t.danger })
     ),
+
+    // Drill-down indicator
+    drillCategory && h('div', {
+      style: {
+        ...styles.card, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8,
+        borderColor: t.accent, background: t.accentSoft,
+      }
+    },
+      h('button', {
+        onClick: () => setDrillCategory(null),
+        style: { background: 'transparent', border: 'none', color: t.accent, fontSize: 16, cursor: 'pointer' }
+      }, '←'),
+      h('div', { style: { flex: 1 } },
+        h('div', { style: { fontSize: 10, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em' } }, 'Filtrado por categoria'),
+        h('div', { style: { fontSize: 16, fontWeight: 600, color: t.accent } }, drillCategory)
+      )
+    ),
+
+    // Controles
     h('div', { style: { ...styles.card, marginBottom: 12 } },
       h('div', { style: styles.cardTitle }, 'Período'),
-      h('div', { style: { display: 'flex', gap: 6, marginBottom: 12 } },
-        ['7','30','90'].map(p => h('button', {
+      h('div', { style: { display: 'flex', gap: 6, marginBottom: 14 } },
+        ['7', '30', '90'].map(p => h('button', {
           key: p, onClick: () => setPeriod(p),
           style: {
             flex: 1, padding: '8px', borderRadius: 10, fontSize: 12,
@@ -1528,7 +2388,7 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
       ),
       h('div', { style: styles.cardTitle }, 'Visualização'),
       h('div', { style: { display: 'flex', gap: 6 } },
-        [['area','Área'],['bar','Barras'],['pie','Categoria']].map(([v,l]) => h('button', {
+        [['area', 'Linha'], ['bar', 'Barras'], ['pie', 'Pizza']].map(([v, l]) => h('button', {
           key: v, onClick: () => setChartType(v),
           style: {
             flex: 1, padding: '8px', borderRadius: 10, fontSize: 12,
@@ -1539,12 +2399,15 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
         }, l))
       )
     ),
+
+    // Gráfico principal
     h('div', { style: { ...styles.card, marginBottom: 12 } },
-      h('div', { style: styles.cardTitle }, chartType === 'pie' ? 'Por categoria' : `Movimento · ${period} dias`),
+      h('div', { style: { ...styles.cardTitle, marginBottom: 4 } },
+        chartType === 'pie' ? `Por categoria · ${monthLabel(summary.currentMonth)}` : `Movimento · ${period} dias`),
       h('div', { style: { width: '100%', height: 240, marginTop: 8 } },
         h(ResponsiveContainer, null,
           chartType === 'area'
-            ? h(AreaChart, { data: chartData },
+            ? h(AreaChart, { data: chartData, margin: { top: 5, right: 8, bottom: 0, left: 0 } },
                 h('defs', null,
                   h('linearGradient', { id: `${gradId}E`, x1: 0, y1: 0, x2: 0, y2: 1 },
                     h('stop', { offset: '0%', stopColor: t.accent, stopOpacity: 0.6 }),
@@ -1559,24 +2422,28 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
                 h(XAxis, { dataKey: 'date', stroke: t.textFaint, fontSize: 10, tickLine: false, axisLine: false,
                   tick: { fill: t.textDim }, interval: Math.max(0, Math.floor(days / 6)) }),
                 h(YAxis, { stroke: t.textFaint, fontSize: 10, tickLine: false, axisLine: false, tick: { fill: t.textDim } }),
-                h(Tooltip, { contentStyle: { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 12, fontSize: 12 } }),
+                h(Tooltip, { contentStyle: { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 12, fontSize: 12 },
+                  formatter: (v) => fmt(v) }),
                 h(Area, { type: 'monotone', dataKey: 'Gastos', stroke: t.accent, strokeWidth: 2, fill: `url(#${gradId}E)` }),
-                h(Area, { type: 'monotone', dataKey: 'Receitas', stroke: t.success, strokeWidth: 2, fill: `url(#${gradId}I)` })
+                !drillCategory && h(Area, { type: 'monotone', dataKey: 'Receitas', stroke: t.success, strokeWidth: 2, fill: `url(#${gradId}I)` })
               )
             : chartType === 'bar'
-              ? h(BarChart, { data: chartData },
+              ? h(BarChart, { data: chartData, margin: { top: 5, right: 8, bottom: 0, left: 0 } },
                   h(CartesianGrid, { stroke: t.border, vertical: false }),
                   h(XAxis, { dataKey: 'date', stroke: t.textFaint, fontSize: 10, tickLine: false, axisLine: false,
                     tick: { fill: t.textDim }, interval: Math.max(0, Math.floor(days / 6)) }),
                   h(YAxis, { stroke: t.textFaint, fontSize: 10, tickLine: false, axisLine: false, tick: { fill: t.textDim } }),
-                  h(Tooltip, { contentStyle: { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 12, fontSize: 12 } }),
-                  h(Bar, { dataKey: 'Gastos', fill: t.accent, radius: [6, 6, 0, 0] }),
-                  h(Bar, { dataKey: 'Receitas', fill: t.success, radius: [6, 6, 0, 0] })
+                  h(Tooltip, { contentStyle: { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 12, fontSize: 12 },
+                    formatter: (v) => fmt(v) }),
+                  h(Bar, { dataKey: 'Gastos', fill: t.accent, radius: [4, 4, 0, 0] }),
+                  !drillCategory && h(Bar, { dataKey: 'Receitas', fill: t.success, radius: [4, 4, 0, 0] })
                 )
               : h(PieChart, null,
                   h(Pie, {
                     data: categoryData, dataKey: 'value', nameKey: 'name',
                     cx: '50%', cy: '50%', outerRadius: 80, innerRadius: 45, paddingAngle: 2,
+                    onClick: (data) => data?.name && setDrillCategory(data.name),
+                    cursor: 'pointer',
                   },
                     categoryData.map((_, i) => h(Cell, { key: i, fill: COLORS[i % COLORS.length], stroke: t.surface, strokeWidth: 2 }))
                   ),
@@ -1586,22 +2453,124 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
         )
       ),
       chartType === 'pie' && h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 } },
-        categoryData.map((c, i) => h('div', {
-          key: c.name, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: t.textDim }
+        categoryData.map((c, i) => h('button', {
+          key: c.name, onClick: () => setDrillCategory(c.name),
+          style: {
+            display: 'flex', alignItems: 'center', gap: 6,
+            fontSize: 11, color: t.textDim, padding: '4px 8px',
+            background: t.surfaceHi, borderRadius: 8, border: `1px solid ${t.border}`,
+            cursor: 'pointer',
+          }
         },
           h('div', { style: { width: 8, height: 8, borderRadius: 2, background: COLORS[i % COLORS.length] } }),
           `${c.name} · ${fmt(c.value)}`
         ))
       )
     ),
-    h('div', { style: styles.card },
-      h('div', { style: styles.cardTitle }, 'Top categorias'),
-      categoryData.slice(0, 5).map((c, i) => {
+
+    // Comparação com mês anterior
+    !drillCategory && h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
+        h('div', { style: styles.cardTitle }, 'Mês a mês'),
+        h('button', {
+          onClick: () => setCompareMonths(!compareMonths),
+          style: { background: 'transparent', border: 'none', color: t.accent, fontSize: 11, fontWeight: 600, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.06em' }
+        }, compareMonths ? 'ocultar' : 'detalhar')
+      ),
+      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: compareMonths ? 16 : 0 } },
+        h('div', null,
+          h('div', { style: { fontSize: 10, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 } },
+            monthLabel(monthCompare.prev)),
+          h('div', { style: { fontSize: 18, fontWeight: 600, color: t.text, fontVariantNumeric: 'tabular-nums' } },
+            fmt(monthCompare.prevTotal))
+        ),
+        h('div', null,
+          h('div', { style: { fontSize: 10, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 } },
+            monthLabel(monthCompare.cur)),
+          h('div', null,
+            h('span', { style: { fontSize: 18, fontWeight: 600, color: t.text, fontVariantNumeric: 'tabular-nums' } },
+              fmt(monthCompare.curTotal)),
+            monthCompare.prevTotal > 0 && h('div', {
+              style: {
+                fontSize: 10, fontWeight: 600, marginTop: 2,
+                color: monthCompare.curTotal > monthCompare.prevTotal ? t.danger : t.success,
+              }
+            },
+              `${monthCompare.curTotal > monthCompare.prevTotal ? '↑' : '↓'} ${
+                Math.abs((monthCompare.curTotal - monthCompare.prevTotal) / monthCompare.prevTotal * 100).toFixed(0)
+              }%`
+            )
+          )
+        )
+      ),
+      compareMonths && monthCompare.rows.length > 0 && h('div', null,
+        monthCompare.rows.slice(0, 10).map(r => h('div', {
+          key: r.name,
+          style: {
+            display: 'grid', gridTemplateColumns: '1fr auto auto auto',
+            gap: 8, alignItems: 'center', padding: '8px 0',
+            borderTop: `1px solid ${t.border}`, fontSize: 13,
+          }
+        },
+          h('span', { style: { color: t.text } }, r.name),
+          h('span', { style: { color: t.textDim, fontSize: 11, fontVariantNumeric: 'tabular-nums' } }, fmt(r.prev)),
+          h('span', { style: { color: t.text, fontWeight: 600, fontVariantNumeric: 'tabular-nums' } }, fmt(r.cur)),
+          h('span', {
+            style: {
+              fontSize: 11, fontWeight: 600,
+              color: r.delta > 0 ? t.danger : r.delta < 0 ? t.success : t.textDim,
+              minWidth: 50, textAlign: 'right',
+            }
+          },
+            r.delta > 0 ? `+${fmt(r.delta).replace('R$ ', '')}` :
+            r.delta < 0 ? `−${fmt(-r.delta).replace('R$ ', '')}` : '0,00'
+          )
+        ))
+      )
+    ),
+
+    // Drill-down: lista de transações se houver categoria selecionada
+    drillCategory && drillTransactions.length > 0 && h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, `${drillCategory} · ${drillTransactions.length} lançamentos · ${period} dias`),
+      drillTransactions.slice(0, 15).map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => {}, onEdit: () => {} })),
+      drillTransactions.length > 15 && h('div', {
+        style: { textAlign: 'center', padding: 8, fontSize: 11, color: t.textDim }
+      }, `+ ${drillTransactions.length - 15} mais`)
+    ),
+
+    // Gasto por dia da semana
+    h('div', { style: { ...styles.card, marginBottom: 12 } },
+      h('div', { style: styles.cardTitle }, `Por dia da semana${drillCategory ? ` · ${drillCategory}` : ''}`),
+      h('div', { style: { width: '100%', height: 140, marginTop: 8 } },
+        h(ResponsiveContainer, null,
+          h(BarChart, { data: byWeekday, margin: { top: 5, right: 8, bottom: 0, left: 0 } },
+            h(XAxis, { dataKey: 'day', stroke: t.textFaint, fontSize: 10, tickLine: false, axisLine: false, tick: { fill: t.textDim } }),
+            h(YAxis, { hide: true }),
+            h(Tooltip, { contentStyle: { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 12, fontSize: 12 },
+              formatter: (v) => fmt(v) }),
+            h(Bar, { dataKey: 'value', fill: t.accent, radius: [4, 4, 0, 0] })
+          )
+        )
+      )
+    ),
+
+    // Top categorias (com clique para drill-down)
+    !drillCategory && h('div', { style: styles.card },
+      h('div', { style: styles.cardTitle }, `Top categorias · ${monthLabel(summary.currentMonth)}`),
+      categoryData.slice(0, 8).map((c, i) => {
         const pct = (c.value / (categoryData[0]?.value || 1)) * 100;
-        return h('div', { key: c.name, style: { marginBottom: 10 } },
+        return h('button', {
+          key: c.name,
+          onClick: () => setDrillCategory(c.name),
+          style: {
+            width: '100%', display: 'block', textAlign: 'left',
+            background: 'transparent', border: 'none', cursor: 'pointer',
+            padding: '8px 0', marginBottom: 4,
+          }
+        },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 } },
             h('span', { style: { color: t.text } }, c.name),
-            h('span', { style: { color: t.textDim, fontWeight: 600 } }, fmt(c.value))
+            h('span', { style: { color: t.textDim, fontWeight: 600, fontVariantNumeric: 'tabular-nums' } }, fmt(c.value))
           ),
           h('div', { style: { height: 4, borderRadius: 2, background: t.surfaceHi, overflow: 'hidden' } },
             h('div', {
@@ -1616,7 +2585,7 @@ const DashboardTab = memo(function DashboardTab({ t, theme, styles, transactions
       }),
       categoryData.length === 0 && h('div', {
         style: { padding: 16, textAlign: 'center', color: t.textFaint, fontSize: 13 }
-      }, 'Sem dados ainda')
+      }, 'Sem gastos neste mês ainda')
     )
   );
 });
@@ -1629,12 +2598,17 @@ const KPI = memo(function KPI({ t, label, value, accent }) {
     }
   },
     h('div', { style: { fontSize: 11, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 } }, label),
-    h('div', { style: { fontSize: 18, fontWeight: 700, color: accent, letterSpacing: '-0.02em' } }, value)
+    h('div', {
+      style: {
+        fontSize: 17, fontWeight: 600, color: accent,
+        letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums',
+      }
+    }, value)
   );
 });
 
 /* ===================== DETAILS ===================== */
-const DetailsTab = memo(function DetailsTab({ t, styles, debts, bills, transactions, toggleDebt, toggleBill, removeDebt, removeBill, removeTx }) {
+const DetailsTab = memo(function DetailsTab({ t, styles, debts, bills, transactions, accounts, toggleDebt, toggleBill, removeDebt, removeBill, removeTx, onEditTx, onEditDebt, onEditBill }) {
   const [search, setSearch] = useState('');
 
   const owesMe = debts.filter(d => d.direction === 'owes_me');
@@ -1659,24 +2633,24 @@ const DetailsTab = memo(function DetailsTab({ t, styles, debts, bills, transacti
       h('div', { style: styles.cardTitle }, `Te devem · ${owesMe.filter(d => !d.paid).length} pendentes`),
       owesMe.length === 0
         ? h('div', { style: { padding: '20px 8px', textAlign: 'center', color: t.textFaint, fontSize: 13 } }, 'Ninguém te deve agora.')
-        : owesMe.map(d => h(DebtRow, { key: d.id, d, t, onToggle: () => toggleDebt(d.id), onDelete: () => { if (confirm('Remover?')) removeDebt(d.id); } }))
+        : owesMe.map(d => h(DebtRow, { key: d.id, d, t, onToggle: () => toggleDebt(d.id), onDelete: () => { if (confirm('Remover?')) removeDebt(d.id); }, onEdit: () => onEditDebt && onEditDebt(d) }))
     ),
     h('div', { style: { ...styles.card, marginBottom: 12 } },
       h('div', { style: styles.cardTitle }, `Você deve · ${iOwe.filter(d => !d.paid).length} pendentes`),
       iOwe.length === 0
         ? h('div', { style: { padding: '20px 8px', textAlign: 'center', color: t.textFaint, fontSize: 13 } }, 'Sem dívidas pessoais.')
-        : iOwe.map(d => h(DebtRow, { key: d.id, d, t, onToggle: () => toggleDebt(d.id), onDelete: () => { if (confirm('Remover?')) removeDebt(d.id); } }))
+        : iOwe.map(d => h(DebtRow, { key: d.id, d, t, onToggle: () => toggleDebt(d.id), onDelete: () => { if (confirm('Remover?')) removeDebt(d.id); }, onEdit: () => onEditDebt && onEditDebt(d) }))
     ),
     h('div', { style: { ...styles.card, marginBottom: 12 } },
       h('div', { style: styles.cardTitle }, `Contas pendentes · ${pendingBills.length}`),
       pendingBills.length === 0
         ? h('div', { style: { padding: '20px 8px', textAlign: 'center', color: t.textFaint, fontSize: 13 } }, 'Nenhuma conta pendente.')
-        : pendingBills.map(b => h(BillRow, { key: b.id, b, t, onToggle: () => toggleBill(b.id), onDelete: () => { if (confirm('Remover?')) removeBill(b.id); } }))
+        : pendingBills.map(b => h(BillRow, { key: b.id, b, t, onToggle: () => toggleBill(b.id), onDelete: () => { if (confirm('Remover?')) removeBill(b.id); }, onEdit: () => onEditBill && onEditBill(b) }))
     ),
     paidBills.length > 0 && h('div', { style: { ...styles.card, marginBottom: 12 } },
       h('div', { style: styles.cardTitle }, 'Contas pagas'),
       paidBills.slice(-8).reverse().map(b =>
-        h(BillRow, { key: b.id, b, t, onToggle: () => toggleBill(b.id), onDelete: () => { if (confirm('Remover?')) removeBill(b.id); } })
+        h(BillRow, { key: b.id, b, t, onToggle: () => toggleBill(b.id), onDelete: () => { if (confirm('Remover?')) removeBill(b.id); }, onEdit: () => onEditBill && onEditBill(b) })
       )
     ),
     h('div', { style: styles.card },
@@ -1689,12 +2663,12 @@ const DetailsTab = memo(function DetailsTab({ t, styles, debts, bills, transacti
       filteredHist.length === 0
         ? h('div', { style: { padding: '20px 8px', textAlign: 'center', color: t.textFaint, fontSize: 13 } },
             search ? 'Nada encontrado.' : 'Nada registrado ainda.')
-        : filteredHist.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => removeTx(tx.id) }))
+        : filteredHist.map(tx => h(TxRow, { key: tx.id, tx, t, onDelete: () => removeTx(tx.id), onEdit: () => onEditTx && onEditTx(tx) }))
     )
   );
 });
 
-const DebtRow = memo(function DebtRow({ d, t, onToggle, onDelete }) {
+const DebtRow = memo(function DebtRow({ d, t, onToggle, onDelete, onEdit }) {
   return h('div', {
     style: {
       display: 'flex', alignItems: 'center', gap: 12,
@@ -1712,7 +2686,10 @@ const DebtRow = memo(function DebtRow({ d, t, onToggle, onDelete }) {
         display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
       }
     }, d.paid ? '✓' : ''),
-    h('div', { style: { flex: 1, minWidth: 0 } },
+    h('div', {
+      onClick: onEdit,
+      style: { flex: 1, minWidth: 0, cursor: onEdit ? 'pointer' : 'default' }
+    },
       h('div', {
         style: {
           fontSize: 14, fontWeight: 600, color: t.text, textTransform: 'capitalize',
@@ -1724,11 +2701,16 @@ const DebtRow = memo(function DebtRow({ d, t, onToggle, onDelete }) {
     ),
     h('div', { style: { fontSize: 15, fontWeight: 700, color: d.direction === 'owes_me' ? t.success : t.danger } },
       fmt(d.amount)),
+    onEdit && h('button', {
+      onClick: onEdit,
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
+      title: 'Editar',
+    }, '✎'),
     h('button', { onClick: onDelete, style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18 } }, '×')
   );
 });
 
-const BillRow = memo(function BillRow({ b, t, onToggle, onDelete }) {
+const BillRow = memo(function BillRow({ b, t, onToggle, onDelete, onEdit }) {
   const isOverdue = !b.paid && b.dueDate && b.dueDate < todayISO();
   return h('div', {
     style: {
@@ -1747,7 +2729,10 @@ const BillRow = memo(function BillRow({ b, t, onToggle, onDelete }) {
         display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
       }
     }, b.paid ? '✓' : ''),
-    h('div', { style: { flex: 1, minWidth: 0 } },
+    h('div', {
+      onClick: onEdit,
+      style: { flex: 1, minWidth: 0, cursor: onEdit ? 'pointer' : 'default' }
+    },
       h('div', {
         style: {
           fontSize: 14, fontWeight: 600, color: t.text, textTransform: 'capitalize',
@@ -1760,6 +2745,11 @@ const BillRow = memo(function BillRow({ b, t, onToggle, onDelete }) {
           : 'Sem vencimento')
     ),
     h('div', { style: { fontSize: 15, fontWeight: 700, color: t.text } }, b.amount ? fmt(b.amount) : '—'),
+    onEdit && h('button', {
+      onClick: onEdit,
+      style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 14, padding: 4 },
+      title: 'Editar',
+    }, '✎'),
     h('button', { onClick: onDelete, style: { background: 'transparent', border: 'none', color: t.textFaint, cursor: 'pointer', fontSize: 18 } }, '×')
   );
 });
@@ -1944,6 +2934,236 @@ const FloatingAssistant = memo(function FloatingAssistant({ t, theme, open, setO
     )
   );
 });
+
+/* ===================== EDIT MODAL ===================== */
+const EditModal = memo(function EditModal({ t, theme, editing, setEditing, accounts, onSave }) {
+  const { kind, item } = editing;
+  // Form state — inicializa com valores atuais
+  const [form, setForm] = useState(() => {
+    if (kind === 'tx') return {
+      amount: item.amount,
+      description: item.description || '',
+      category: item.category || '',
+      date: item.date || todayISO(),
+      accountId: item.accountId || '',
+      type: item.type,
+    };
+    if (kind === 'debt') return {
+      amount: item.amount,
+      person: item.person || '',
+      description: item.description || '',
+      date: item.date || todayISO(),
+      direction: item.direction,
+    };
+    if (kind === 'bill') return {
+      amount: item.amount || 0,
+      name: item.name || '',
+      dueDate: item.dueDate || '',
+    };
+    if (kind === 'account') return {
+      name: item.name || '',
+      initialBalance: item.initialBalance || 0,
+    };
+    return {};
+  });
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const handleSubmit = () => {
+    // Sanitiza: amount/initialBalance numbers
+    const patch = { ...form };
+    if (patch.amount !== undefined) patch.amount = Number(patch.amount) || 0;
+    if (patch.initialBalance !== undefined) patch.initialBalance = Number(patch.initialBalance) || 0;
+    if (patch.accountId === '') patch.accountId = null;
+    onSave(patch);
+  };
+
+  const close = () => setEditing(null);
+
+  const inputStyle = {
+    width: '100%', padding: '12px 14px', borderRadius: 12,
+    background: t.surfaceHi, border: `1px solid ${t.border}`,
+    color: t.text, fontSize: 14, outline: 'none',
+    fontFamily: 'inherit', boxSizing: 'border-box', marginTop: 4,
+  };
+  const labelStyle = { fontSize: 11, color: t.textDim, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 };
+
+  const title = kind === 'tx' ? 'Editar lançamento'
+              : kind === 'debt' ? 'Editar dívida'
+              : kind === 'bill' ? 'Editar conta'
+              : 'Editar local';
+
+  return h(Fragment, null,
+    h('div', {
+      onClick: close,
+      style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)',
+        zIndex: 80, animation: 'fadeIn 0.2s ease' }
+    }),
+    h('div', {
+      style: {
+        position: 'fixed', bottom: 0, left: 0, right: 0,
+        background: t.surface, borderTopLeftRadius: 24, borderTopRightRadius: 24,
+        padding: `20px 20px calc(env(safe-area-inset-bottom) + 24px)`,
+        zIndex: 90, boxShadow: '0 -8px 40px rgba(0,0,0,0.4)',
+        animation: 'slideUp 0.3s cubic-bezier(0.32, 0.72, 0, 1)',
+        maxWidth: 480, margin: '0 auto',
+        border: `1px solid ${t.border}`, borderBottom: 'none',
+        maxHeight: '85vh', overflowY: 'auto',
+      }
+    },
+      h('div', { style: { width: 36, height: 4, background: t.textFaint, borderRadius: 2, margin: '0 auto 16px', opacity: 0.4 } }),
+      h('div', { style: { fontSize: 18, fontWeight: 700, color: t.text, marginBottom: 16 } }, title),
+
+      // Campos por tipo
+      kind === 'tx' && h(Fragment, null,
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Tipo'),
+          h('div', { style: { display: 'flex', gap: 6, marginTop: 4 } },
+            ['expense', 'income'].map(tp => h('button', {
+              key: tp, onClick: () => set('type', tp),
+              style: {
+                flex: 1, padding: 10, borderRadius: 10, fontSize: 13,
+                border: `1px solid ${t.border}`, cursor: 'pointer',
+                background: form.type === tp ? t.accent : t.surfaceHi,
+                color: form.type === tp ? '#fff' : t.text, fontWeight: 600,
+              }
+            }, tp === 'expense' ? 'Gasto' : 'Receita'))
+          )
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Valor (R$)'),
+          h('input', {
+            type: 'number', step: '0.01', style: inputStyle,
+            value: form.amount, onChange: (e) => set('amount', e.target.value),
+          })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Descrição'),
+          h('input', {
+            style: inputStyle, value: form.description,
+            onChange: (e) => set('description', e.target.value),
+          })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Categoria'),
+          h('input', {
+            style: inputStyle, value: form.category,
+            onChange: (e) => set('category', e.target.value),
+          })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Data'),
+          h('input', {
+            type: 'date', style: inputStyle, value: form.date,
+            onChange: (e) => set('date', e.target.value),
+          })
+        ),
+        accounts && accounts.length > 0 && h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Local vinculado'),
+          h('select', {
+            style: inputStyle, value: form.accountId,
+            onChange: (e) => set('accountId', e.target.value),
+          },
+            h('option', { value: '' }, '— Não vinculado —'),
+            accounts.filter(a => !a.archived).map(a =>
+              h('option', { key: a.id, value: a.id }, a.name)
+            )
+          )
+        )
+      ),
+
+      kind === 'debt' && h(Fragment, null,
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Direção'),
+          h('div', { style: { display: 'flex', gap: 6, marginTop: 4 } },
+            [['owes_me', 'Me devem'], ['i_owe', 'Eu devo']].map(([v, lbl]) => h('button', {
+              key: v, onClick: () => set('direction', v),
+              style: {
+                flex: 1, padding: 10, borderRadius: 10, fontSize: 13,
+                border: `1px solid ${t.border}`, cursor: 'pointer',
+                background: form.direction === v ? t.accent : t.surfaceHi,
+                color: form.direction === v ? '#fff' : t.text, fontWeight: 600,
+              }
+            }, lbl))
+          )
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Pessoa'),
+          h('input', { style: inputStyle, value: form.person, onChange: (e) => set('person', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Valor (R$)'),
+          h('input', { type: 'number', step: '0.01', style: inputStyle,
+            value: form.amount, onChange: (e) => set('amount', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Descrição'),
+          h('input', { style: inputStyle, value: form.description,
+            onChange: (e) => set('description', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Data'),
+          h('input', { type: 'date', style: inputStyle, value: form.date,
+            onChange: (e) => set('date', e.target.value) })
+        )
+      ),
+
+      kind === 'bill' && h(Fragment, null,
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Nome'),
+          h('input', { style: inputStyle, value: form.name,
+            onChange: (e) => set('name', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Valor (R$)'),
+          h('input', { type: 'number', step: '0.01', style: inputStyle,
+            value: form.amount, onChange: (e) => set('amount', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Vencimento'),
+          h('input', { type: 'date', style: inputStyle, value: form.dueDate || '',
+            onChange: (e) => set('dueDate', e.target.value) })
+        )
+      ),
+
+      kind === 'account' && h(Fragment, null,
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Nome do local'),
+          h('input', { style: inputStyle, value: form.name,
+            onChange: (e) => set('name', e.target.value) })
+        ),
+        h('div', { style: { marginBottom: 12 } },
+          h('label', { style: labelStyle }, 'Saldo inicial (R$)'),
+          h('input', { type: 'number', step: '0.01', style: inputStyle,
+            value: form.initialBalance, onChange: (e) => set('initialBalance', e.target.value) }),
+          h('div', { style: { fontSize: 11, color: t.textDim, marginTop: 4 } },
+            'O saldo atual é calculado a partir desse valor + transações vinculadas.')
+        )
+      ),
+
+      // Botões
+      h('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+        h('button', {
+          onClick: close,
+          style: {
+            flex: 1, padding: 14, borderRadius: 14,
+            background: t.surfaceHi, color: t.text, border: `1px solid ${t.border}`,
+            fontSize: 15, fontWeight: 600, cursor: 'pointer',
+          }
+        }, 'Cancelar'),
+        h('button', {
+          onClick: handleSubmit,
+          style: {
+            flex: 1, padding: 14, borderRadius: 14,
+            background: t.accent, color: '#fff', border: 'none',
+            fontSize: 15, fontWeight: 600, cursor: 'pointer',
+          }
+        }, 'Salvar')
+      )
+    )
+  );
+});
+
 
 /* ===================== MOUNT ===================== */
 const root = ReactDOM.createRoot(document.getElementById('root'));
